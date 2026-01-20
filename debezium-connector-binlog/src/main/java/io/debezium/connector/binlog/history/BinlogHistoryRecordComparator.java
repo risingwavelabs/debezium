@@ -15,12 +15,16 @@ import io.debezium.connector.binlog.gtid.GtidSetFactory;
 import io.debezium.document.Document;
 import io.debezium.relational.history.HistoryRecordComparator;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 /**
  * Base implementation of the {@link HistoryRecordComparator} for binlog-based connectors.
  *
  * @author Chris Cranford
  */
 public abstract class BinlogHistoryRecordComparator extends HistoryRecordComparator {
+    protected static final Logger LOGGER = LoggerFactory.getLogger(BinlogHistoryRecordComparator.class);
 
     private final Predicate<String> gtidSourceFilter;
     private final GtidSetFactory gtidSetFactory;
@@ -50,6 +54,8 @@ public abstract class BinlogHistoryRecordComparator extends HistoryRecordCompara
     @Override
     @VisibleForTesting
     public boolean isPositionAtOrBefore(Document recorded, Document desired) {
+        LOGGER.debug("recorded: " + recorded);
+        LOGGER.debug("desired: " + desired);
         final String recordedGtid = getGtidSet(recorded);
         final String desiredGtid = getGtidSet(desired);
         if (desiredGtid != null) {
@@ -174,7 +180,7 @@ public abstract class BinlogHistoryRecordComparator extends HistoryRecordCompara
      * @return the timestamp value
      */
     protected long getTimestamp(Document document) {
-        return document.getLong(BinlogSourceInfo.TIMESTAMP_KEY, 0);
+        return document.getLong(BinlogOffsetContext.TIMESTAMP_KEY, 0);
     }
 
     /**
