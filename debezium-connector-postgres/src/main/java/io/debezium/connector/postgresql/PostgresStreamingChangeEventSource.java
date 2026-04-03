@@ -92,6 +92,7 @@ public class PostgresStreamingChangeEventSource implements StreamingChangeEventS
     private long numberOfEventsSinceLastEventSentOrWalGrowingWarning = 0;
     private Lsn lastCompletelyProcessedLsn;
     private PostgresOffsetContext effectiveOffset;
+    private Runnable onConnectedCallback;
 
     public PostgresStreamingChangeEventSource(PostgresConnectorConfig connectorConfig, SnapshotterService snapshotterService,
                                               PostgresConnection connection, PostgresEventDispatcher<TableId> dispatcher, ErrorHandler errorHandler, Clock clock,
@@ -108,6 +109,13 @@ public class PostgresStreamingChangeEventSource implements StreamingChangeEventS
         this.replicationConnection = replicationConnection;
         this.connectionProbeTimer = ElapsedTimeStrategy.constant(Clock.system(), connectorConfig.statusUpdateInterval());
 
+    }
+
+    /**
+     * Set a callback to be invoked once the replication connection is truly established.
+     */
+    public void setOnConnectedCallback(Runnable callback) {
+        this.onConnectedCallback = callback;
     }
 
     @Override
@@ -160,6 +168,10 @@ public class PostgresStreamingChangeEventSource implements StreamingChangeEventS
                 LOGGER.info("No previous LSN found in Kafka, streaming from the latest xlogpos or flushed LSN...");
                 walPosition = new WalPositionLocator();
                 replicationStream.compareAndSet(null, replicationConnection.startStreaming(walPosition));
+            }
+
+            if (onConnectedCallback != null) {
+                onConnectedCallback.run();
             }
 
             // Start keep alive thread to prevent connection timeout during time-consuming operations the DB side.
