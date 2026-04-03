@@ -347,6 +347,17 @@ public class ChangeEventSourceCoordinator<P extends Partition, O extends OffsetC
                 .getIncrementalSnapshotChangeEventSource(offsetContext, snapshotMetrics, snapshotMetrics, notificationService);
         eventDispatcher.setIncrementalSnapshotChangeEventSource(incrementalSnapshotChangeEventSource);
         incrementalSnapshotChangeEventSource.ifPresent(x -> x.init(partition, offsetContext));
+        // Emit an initial heartbeat once streaming is established so downstream consumers can
+        // observe liveness immediately, without waiting for the first interval to elapse.
+        if (eventDispatcher.heartbeatsEnabled()) {
+            // For databases like Postgres, the offset may be empty if no tables are captured in the snapshot.
+            if (offsetContext == null || offsetContext.getOffset() == null || offsetContext.getOffset().isEmpty()) {
+                LOGGER.info("No offset found, skipping the initial heartbeat");
+                return;
+            }
+            LOGGER.info("Emit the initial heartbeat.");
+            eventDispatcher.alwaysDispatchHeartbeatEvent(partition, offsetContext);
+        }
     }
 
     public void commitOffset(Map<String, ?> partition, Map<String, ?> offset) {
