@@ -102,6 +102,8 @@ public class SqlServerStreamingChangeEventSource implements StreamingChangeEvent
     private boolean checkAgent;
     private SqlServerOffsetContext effectiveOffset;
     private final NotificationService<SqlServerPartition, SqlServerOffsetContext> notificationService;
+    private Runnable onConnectedCallback;
+    private final AtomicBoolean connectedSignaled = new AtomicBoolean(false);
 
     public SqlServerStreamingChangeEventSource(SqlServerConnectorConfig connectorConfig, SqlServerConnection dataConnection,
                                                SqlServerConnection metadataConnection,
@@ -126,6 +128,10 @@ public class SqlServerStreamingChangeEventSource implements StreamingChangeEvent
                         : intervalBetweenCommitsBasedOnPoll.toMillis());
         this.streamingExecutionContexts = new HashMap<>();
         this.checkAgent = true;
+    }
+
+    public void setOnConnectedCallback(Runnable callback) {
+        this.onConnectedCallback = callback;
     }
 
     @Override
@@ -200,6 +206,10 @@ public class SqlServerStreamingChangeEventSource implements StreamingChangeEvent
                 }
                 else if (!checkAgent) {
                     checkAgent = true;
+                }
+
+                if (connectedSignaled.compareAndSet(false, true) && onConnectedCallback != null) {
+                    onConnectedCallback.run();
                 }
                 // There is no change in the database
                 if (toLsn.compareTo(lastProcessedPosition.getCommitLsn()) <= 0 && streamingExecutionContext.getShouldIncreaseFromLsn()) {

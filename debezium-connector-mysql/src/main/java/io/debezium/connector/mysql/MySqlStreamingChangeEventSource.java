@@ -7,12 +7,15 @@ package io.debezium.connector.mysql;
 
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Predicate;
 
 import org.apache.kafka.connect.source.SourceConnector;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.github.shyiko.mysql.binlog.BinaryLogClient;
 import com.github.shyiko.mysql.binlog.GtidSet;
 import com.github.shyiko.mysql.binlog.event.AnnotateRowsEventData;
 import com.github.shyiko.mysql.binlog.event.Event;
@@ -24,6 +27,7 @@ import com.github.shyiko.mysql.binlog.network.SSLMode;
 
 import io.debezium.connector.binlog.BinlogConnectorConfig;
 import io.debezium.connector.binlog.BinlogStreamingChangeEventSource;
+import io.debezium.connector.binlog.BinlogTaskContext;
 import io.debezium.connector.binlog.jdbc.BinlogConnectorConnection;
 import io.debezium.pipeline.ErrorHandler;
 import io.debezium.pipeline.EventDispatcher;
@@ -41,6 +45,8 @@ public class MySqlStreamingChangeEventSource extends BinlogStreamingChangeEventS
 
     private final MySqlConnectorConfig connectorConfig;
     private GtidSet gtidSet;
+    private Runnable onConnectedCallback;
+    private final AtomicBoolean connectedSignaled = new AtomicBoolean(false);
 
     public MySqlStreamingChangeEventSource(MySqlConnectorConfig connectorConfig,
                                            BinlogConnectorConnection connection,
@@ -52,6 +58,27 @@ public class MySqlStreamingChangeEventSource extends BinlogStreamingChangeEventS
                                            SnapshotterService snapshotterService) {
         super(connectorConfig, connection, dispatcher, errorHandler, clock, taskContext, taskContext.getSchema(), metrics, snapshotterService);
         this.connectorConfig = connectorConfig;
+    }
+
+    public void setOnConnectedCallback(Runnable callback) {
+        this.onConnectedCallback = callback;
+    }
+
+    @Override
+    protected BinaryLogClient createBinaryLogClient(BinlogTaskContext<?> taskContext,
+                                                    BinlogConnectorConfig connectorConfig,
+                                                    Map<String, Thread> clientThreads,
+                                                    BinlogConnectorConnection connection) {
+        BinaryLogClient client = super.createBinaryLogClient(taskContext, connectorConfig, clientThreads, connection);
+        client.registerLifecycleListener(new BinaryLogClient.AbstractLifecycleListener() {
+            @Override
+            public void onConnect(BinaryLogClient client) {
+                if (connectedSignaled.compareAndSet(false, true) && onConnectedCallback != null) {
+                    onConnectedCallback.run();
+                }
+            }
+        });
+        return client;
     }
 
     @Override

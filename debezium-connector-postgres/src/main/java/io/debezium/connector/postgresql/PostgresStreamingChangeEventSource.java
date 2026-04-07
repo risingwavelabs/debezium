@@ -98,6 +98,7 @@ public class PostgresStreamingChangeEventSource
 
     private Lsn lastCompletelyProcessedLsn;
     private PostgresOffsetContext effectiveOffset;
+    private Runnable onConnectedCallback;
 
     public PostgresStreamingChangeEventSource(
                                               PostgresConnectorConfig connectorConfig,
@@ -121,6 +122,13 @@ public class PostgresStreamingChangeEventSource
         this.replicationConnection = replicationConnection;
         this.connectionProbeTimer = ElapsedTimeStrategy.constant(
                 Clock.system(), connectorConfig.statusUpdateInterval());
+    }
+
+    /**
+     * Set a callback to be invoked once the replication connection is truly established.
+     */
+    public void setOnConnectedCallback(Runnable callback) {
+        this.onConnectedCallback = callback;
     }
 
     @Override
@@ -229,6 +237,11 @@ public class PostgresStreamingChangeEventSource
                                 PostgresConnector.class,
                                 connectorConfig.getLogicalName(),
                                 KEEP_ALIVE_THREAD_NAME));
+            }
+
+            // Signal connected only when the final streaming session is ready.
+            if (onConnectedCallback != null) {
+                onConnectedCallback.run();
             }
             processMessages(context, partition, this.effectiveOffset, stream);
         }
