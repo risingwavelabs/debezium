@@ -184,9 +184,6 @@ public class SqlServerStreamingChangeEventSource implements StreamingChangeEvent
             if (context.isRunning()) {
                 commitTransaction();
                 final Lsn toLsn = getToLsn(dataConnection, databaseName, lastProcessedPosition, maxTransactionsPerIteration);
-                if (connectedSignaled.compareAndSet(false, true) && onConnectedCallback != null) {
-                    onConnectedCallback.run();
-                }
 
                 // Shouldn't happen if the agent is running, but it is better to guard against such situation
                 if (!toLsn.isAvailable()) {
@@ -209,6 +206,10 @@ public class SqlServerStreamingChangeEventSource implements StreamingChangeEvent
                 }
                 else if (!checkAgent) {
                     checkAgent = true;
+                }
+
+                if (connectedSignaled.compareAndSet(false, true) && onConnectedCallback != null) {
+                    onConnectedCallback.run();
                 }
                 // There is no change in the database
                 if (toLsn.compareTo(lastProcessedPosition.getCommitLsn()) <= 0 && streamingExecutionContext.getShouldIncreaseFromLsn()) {
