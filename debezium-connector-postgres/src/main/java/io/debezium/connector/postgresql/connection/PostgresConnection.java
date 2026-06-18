@@ -297,6 +297,10 @@ public class PostgresConnection extends JdbcConnection {
         final ServerInfo.ReplicationSlot slot = queryForSlot(slotName, database, pluginName,
                 rs -> {
                     if (rs.next()) {
+                        String wal_status = rs.getString("wal_status");
+                        if (wal_status.equals("lost")) {
+                            return ServerInfo.ReplicationSlot.WAL_STATUS_LOST;
+                        }
                         boolean active = rs.getBoolean("active");
                         final Lsn confirmedFlushedLsn = parseConfirmedFlushLsn(slotName, pluginName, database, rs);
                         if (confirmedFlushedLsn == null) {
@@ -337,6 +341,11 @@ public class PostgresConnection extends JdbcConnection {
 
         for (int attempt = 1; attempt <= MAX_ATTEMPTS_FOR_OBTAINING_REPLICATION_SLOT; attempt++) {
             final ServerInfo.ReplicationSlot slot = fetchReplicationSlotInfo(slotName, pluginName);
+            if (slot == ServerInfo.ReplicationSlot.WAL_STATUS_LOST) {
+                String error_message = String.format("Unable to obtain valid replication slot {}: wal_status is lost", slot);
+                LOGGER.warn(error_message);
+                throw new ConnectException(error_message);
+            }
             if (slot != null) {
                 LOGGER.info("Obtained valid replication slot {}", slot);
                 return slot;

@@ -115,6 +115,7 @@ public class ServerInfo {
      */
     protected static class ReplicationSlot {
         protected static final ReplicationSlot INVALID = new ReplicationSlot(false, null, null, null);
+        protected static final ReplicationSlot WAL_STATUS_LOST = new ReplicationSlot(false, null, null, null);
 
         private boolean active;
         private Lsn latestFlushedLsn;
