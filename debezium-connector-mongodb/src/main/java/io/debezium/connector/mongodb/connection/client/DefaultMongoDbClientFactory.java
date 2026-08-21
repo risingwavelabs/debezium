@@ -45,7 +45,7 @@ public class DefaultMongoDbClientFactory implements MongoDbClientFactory {
         String connectionString = connectorConfig.getConnectionString().getConnectionString();
         Optional<SSLContext> tlsSslContext = tlsFiles.isEmpty()
                 ? Optional.empty()
-                : Optional.of(MongoDbTlsUtils.createTlsSslContext(connectionString, tlsFiles));
+                : Optional.of(MongoDbTlsUtils.createTlsSslContext(connectionString, tlsFiles, connectorConfig));
         SSLContext sslContext = tlsSslContext.orElseGet(() -> MongoDbClientFactory.createSSLContext(connectorConfig));
 
         // 1. apply property configuration
