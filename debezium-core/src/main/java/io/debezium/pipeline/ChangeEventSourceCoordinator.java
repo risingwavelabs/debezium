@@ -341,20 +341,17 @@ public class ChangeEventSourceCoordinator<P extends Partition, O extends OffsetC
 
         boolean deferConnectedSignal = false;
         if (streamingSource instanceof io.debezium.connector.postgresql.PostgresStreamingChangeEventSource) {
-            io.debezium.connector.postgresql.PostgresStreamingChangeEventSource pgSource =
-                    (io.debezium.connector.postgresql.PostgresStreamingChangeEventSource) streamingSource;
+            io.debezium.connector.postgresql.PostgresStreamingChangeEventSource pgSource = (io.debezium.connector.postgresql.PostgresStreamingChangeEventSource) streamingSource;
             pgSource.setOnConnectedCallback(() -> streamingConnected(true));
             deferConnectedSignal = true;
         }
         else if (streamingSource instanceof io.debezium.connector.mysql.MySqlStreamingChangeEventSource) {
-            io.debezium.connector.mysql.MySqlStreamingChangeEventSource mysqlSource =
-                    (io.debezium.connector.mysql.MySqlStreamingChangeEventSource) streamingSource;
+            io.debezium.connector.mysql.MySqlStreamingChangeEventSource mysqlSource = (io.debezium.connector.mysql.MySqlStreamingChangeEventSource) streamingSource;
             mysqlSource.setOnConnectedCallback(() -> streamingConnected(true));
             deferConnectedSignal = true;
         }
         else if (streamingSource instanceof io.debezium.connector.sqlserver.SqlServerStreamingChangeEventSource) {
-            io.debezium.connector.sqlserver.SqlServerStreamingChangeEventSource sqlServerSource =
-                    (io.debezium.connector.sqlserver.SqlServerStreamingChangeEventSource) streamingSource;
+            io.debezium.connector.sqlserver.SqlServerStreamingChangeEventSource sqlServerSource = (io.debezium.connector.sqlserver.SqlServerStreamingChangeEventSource) streamingSource;
             sqlServerSource.setOnConnectedCallback(() -> streamingConnected(true));
             deferConnectedSignal = true;
         }
@@ -395,6 +392,14 @@ public class ChangeEventSourceCoordinator<P extends Partition, O extends OffsetC
         }
     }
 
+    private void forceCloseStreamingSourceConnection() {
+        if (streamingSource instanceof io.debezium.connector.postgresql.PostgresStreamingChangeEventSource) {
+            ((io.debezium.connector.postgresql.PostgresStreamingChangeEventSource) streamingSource).forceCloseConnection();
+        }
+        // SQL Server has the same uninterruptible JDBC commit() pattern; follow-up tracked
+        // separately. MySQL (BinaryLogClient) and MongoDB (cursor) are not affected.
+    }
+
     /**
      * Stops this coordinator.
      */
@@ -416,7 +421,20 @@ public class ChangeEventSourceCoordinator<P extends Partition, O extends OffsetC
                 // Clear interrupt flag so the forced termination is always attempted
                 Thread.interrupted();
                 executor.shutdownNow();
-                executor.awaitTermination(shutdownWaitTimeout, TimeUnit.MILLISECONDS);
+                boolean shutdownNowOk = executor.awaitTermination(shutdownWaitTimeout, TimeUnit.MILLISECONDS);
+                if (!shutdownNowOk) {
+                    // shutdownNow() only interrupts; native JDBC commit() ignores
+                    // Thread.interrupt(). Force-close the underlying source connection so the
+                    // wedged commit throws SocketException, allowing the source thread to unwind
+                    // through its finally block (which releases keep-alive threads + replication
+                    // slot). See risingwavelabs/risingwave#26075.
+                    forceCloseStreamingSourceConnection();
+                    boolean forceCloseOk = executor.awaitTermination(shutdownWaitTimeout, TimeUnit.MILLISECONDS);
+                    if (!forceCloseOk) {
+                        LOGGER.warn("Source thread still not terminated after force-closing the connection; "
+                                + "the replication slot may remain held. See risingwavelabs/risingwave#26075");
+                    }
+                }
             }
 
             if (!isBlockingSnapshotShutdown) {
