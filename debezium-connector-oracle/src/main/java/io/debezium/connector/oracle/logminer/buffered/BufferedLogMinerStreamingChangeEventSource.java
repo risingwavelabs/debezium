@@ -509,9 +509,6 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
         if (dispatchTransactionCommittedEvent) {
             getEventDispatcher().dispatchTransactionCommittedEvent(getPartition(), getOffsetContext(), transaction.getChangeTime());
         }
-        else {
-            getEventDispatcher().dispatchHeartbeatEvent(getPartition(), getOffsetContext());
-        }
 
         getBatchMetrics().commitObserved();
 
@@ -683,7 +680,6 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
             final Scn miningSessionStartScn = minCacheScn.subtract(Scn.ONE);
 
             getOffsetContext().setScn(miningSessionStartScn);
-            getEventDispatcher().dispatchHeartbeatEvent(getPartition(), getOffsetContext());
 
             getMetrics().setOffsetScn(getOffsetContext().getScn());
             return new ProcessResult(miningSessionStartScn, miningSessionStartScn);
@@ -695,7 +691,6 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
             if (!maxCommittedScn.isNull()) {
                 // If transactions have been committed, advance to the max committed value
                 getOffsetContext().setScn(maxCommittedScn);
-                getEventDispatcher().dispatchHeartbeatEvent(getPartition(), getOffsetContext());
             }
 
             getMetrics().setOffsetScn(getOffsetContext().getScn());
@@ -987,7 +982,6 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
 
                     getOffsetContext().setScn(thresholdScn);
                 }
-                getEventDispatcher().dispatchHeartbeatEvent(getPartition(), getOffsetContext());
             }
         }
     }

@@ -403,6 +403,9 @@ public abstract class AbstractLogMinerStreamingChangeEventSource
 
             getBatchMetrics().updateStreamingMetrics();
 
+            // Check heartbeats even when there are no captured row changes.
+            getEventDispatcher().dispatchHeartbeatEvent(getPartition(), getOffsetContext());
+
             if (getBatchMetrics().hasProcessedAnyTransactions()) {
                 getOffsetActivityMonitor().checkForStaleOffsets();
             }
