@@ -244,7 +244,11 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
 
             logActiveTransactions();
 
-            return calculateNewStartScn(startScn, endScn, getOffsetContext().getCommitScn().getMaxCommittedScn());
+            final ProcessResult result = calculateNewStartScn(startScn, endScn, getOffsetContext().getCommitScn().getMaxCommittedScn());
+
+            dispatchHeartbeatEvent();
+
+            return result;
         }
     }
 
