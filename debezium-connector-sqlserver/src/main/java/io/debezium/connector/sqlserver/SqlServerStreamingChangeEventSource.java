@@ -185,7 +185,12 @@ public class SqlServerStreamingChangeEventSource implements StreamingChangeEvent
                 commitTransaction();
                 final Lsn toLsn = getToLsn(dataConnection, databaseName, lastProcessedPosition, maxTransactionsPerIteration);
 
-                // Shouldn't happen if the agent is running, but it is better to guard against such situation
+                // A successful query proves that streaming is connected. An unavailable toLsn only means
+                // that no transaction has been captured after the start position yet.
+                if (connectedSignaled.compareAndSet(false, true) && onConnectedCallback != null) {
+                    onConnectedCallback.run();
+                }
+
                 if (!toLsn.isAvailable()) {
                     if (checkAgent) {
                         try {
@@ -206,10 +211,6 @@ public class SqlServerStreamingChangeEventSource implements StreamingChangeEvent
                 }
                 else if (!checkAgent) {
                     checkAgent = true;
-                }
-
-                if (connectedSignaled.compareAndSet(false, true) && onConnectedCallback != null) {
-                    onConnectedCallback.run();
                 }
                 // There is no change in the database
                 if (toLsn.compareTo(lastProcessedPosition.getCommitLsn()) <= 0 && streamingExecutionContext.getShouldIncreaseFromLsn()) {
