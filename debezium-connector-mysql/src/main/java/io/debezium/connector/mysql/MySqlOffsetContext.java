@@ -18,11 +18,7 @@ import io.debezium.pipeline.source.snapshot.incremental.SignalBasedIncrementalSn
 import io.debezium.pipeline.txmetadata.TransactionContext;
 import io.debezium.relational.TableId;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 public class MySqlOffsetContext extends BinlogOffsetContext<SourceInfo> {
-    protected static final Logger LOGGER = LoggerFactory.getLogger(MySqlOffsetContext.class);
 
     public MySqlOffsetContext(SnapshotType snapshot, boolean snapshotCompleted, TransactionContext transactionContext,
                               IncrementalSnapshotContext<TableId> incrementalSnapshotContext, SourceInfo sourceInfo) {
@@ -69,13 +65,6 @@ public class MySqlOffsetContext extends BinlogOffsetContext<SourceInfo> {
             offsetContext.setInitialSkips(longOffsetValue(offset, EVENTS_TO_SKIP_OFFSET_KEY),
                     (int) longOffsetValue(offset, SourceInfo.BINLOG_ROW_IN_EVENT_OFFSET_KEY));
             offsetContext.setCompletedGtidSet((String) offset.get(GTID_SET_KEY)); // may be null
-
-            LOGGER.debug("provided offset: " + offset);
-            long serverId = longOffsetValue(offset, SourceInfo.SERVER_ID_KEY);
-            offsetContext.setServerIdFromOffset(serverId);
-            long timestamp = longOffsetValue(offset, TIMESTAMP_KEY);
-            offsetContext.setTsSecFromOffset(timestamp);
-            
             return offsetContext;
         }
     }

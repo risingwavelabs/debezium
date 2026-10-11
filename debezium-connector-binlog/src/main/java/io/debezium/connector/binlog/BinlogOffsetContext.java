@@ -23,9 +23,6 @@ import io.debezium.relational.TableId;
 import io.debezium.spi.schema.DataCollectionId;
 import io.debezium.util.Strings;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 /**
  * A concrete implementation of the {@link CommonOffsetContext} for binlog-based connectors that tracks the
  * current offset within the source database change stream. This reflects the committed offset state and
@@ -34,7 +31,6 @@ import org.slf4j.LoggerFactory;
  * @author Chris Cranford
  */
 public class BinlogOffsetContext<T extends BinlogSourceInfo> extends CommonOffsetContext<T> {
-    protected static final Logger LOGGER = LoggerFactory.getLogger(BinlogOffsetContext.class);
 
     public static final String EVENTS_TO_SKIP_OFFSET_KEY = "event";
     public static final String TIMESTAMP_KEY = "ts_sec";
@@ -53,8 +49,6 @@ public class BinlogOffsetContext<T extends BinlogSourceInfo> extends CommonOffse
     private long currentEventLengthInBytes = 0;
     private boolean inTransaction = false;
     private String transactionId = null;
-    private long serverIdFromOffset = 0;
-    private long tsSecFromOffset = 0;
 
     public BinlogOffsetContext(SnapshotType snapshot, boolean snapshotCompleted, TransactionContext transactionContext,
                                IncrementalSnapshotContext<TableId> incrementalSnapshotContext, T sourceInfo) {
@@ -162,14 +156,6 @@ public class BinlogOffsetContext<T extends BinlogSourceInfo> extends CommonOffse
             this.currentGtidSet = trimmedGtidSet;
             this.restartGtidSet = trimmedGtidSet;
         }
-    }
-
-    public void setServerIdFromOffset(long serverId) {
-        this.serverIdFromOffset = serverId;
-    }
-
-    public void setTsSecFromOffset(long tsSec) {
-        this.tsSecFromOffset = tsSec;
     }
 
     /**
@@ -333,8 +319,6 @@ public class BinlogOffsetContext<T extends BinlogSourceInfo> extends CommonOffse
         final Map<String, Object> map = new HashMap<>();
         if (sourceInfo.getServerId() != 0) {
             map.put(BinlogSourceInfo.SERVER_ID_KEY, sourceInfo.getServerId());
-        } else {
-            map.put(BinlogSourceInfo.SERVER_ID_KEY, serverIdFromOffset);
         }
         if (restartGtidSet != null) {
             // Put the previously-completed GTID set in the offset along with the event number ...
@@ -350,8 +334,6 @@ public class BinlogOffsetContext<T extends BinlogSourceInfo> extends CommonOffse
         }
         if (sourceInfo.timestamp() != null) {
             map.put(TIMESTAMP_KEY, sourceInfo.timestamp().getEpochSecond());
-        } else {
-            map.put(TIMESTAMP_KEY, tsSecFromOffset);
         }
         return map;
     }
