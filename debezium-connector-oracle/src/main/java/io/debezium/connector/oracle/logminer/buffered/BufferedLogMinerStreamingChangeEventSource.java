@@ -524,6 +524,7 @@ public class BufferedLogMinerStreamingChangeEventSource extends AbstractLogMiner
         }
 
         updateCommitMetrics(row, Duration.between(start, Instant.now()));
+        getOffsetContext().removeSnapshotPendingTransaction(transactionId);
     }
 
     @Override
