@@ -418,6 +418,18 @@ public abstract class AbstractLogMinerStreamingChangeEventSource
     }
 
     /**
+     * Checks whether a heartbeat should be emitted after a mining iteration.
+     * <p>
+     * This must be called once the iteration's offset bookkeeping is complete so that any heartbeat
+     * that is emitted carries the up-to-date offsets, even when no captured row changes were dispatched.
+     *
+     * @throws InterruptedException if the thread is interrupted
+     */
+    protected void dispatchHeartbeatEvent() throws InterruptedException {
+        getEventDispatcher().dispatchHeartbeatEvent(getPartition(), getOffsetContext());
+    }
+
+    /**
      * Execute any steps that should occur before dispatching a data change event.
      *
      * @param event the event, should not be {@code null}

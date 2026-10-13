@@ -269,6 +269,8 @@ public class UnbufferedLogMinerStreamingChangeEventSource extends AbstractLogMin
                 LOGGER.debug("Adjusting Min Commit SCN from {} to {}.", minCommitScn, lastCommitScn);
             }
 
+            dispatchHeartbeatEvent();
+
             return lastCommitScn;
         }
     }
