@@ -393,6 +393,7 @@ public class UnbufferedLogMinerStreamingChangeEventSource extends AbstractLogMin
 
         getMetrics().setActiveTransactionCount(0L);
         updateCommitMetrics(event, Duration.between(commitStartTime, Instant.now()));
+        getOffsetContext().removeSnapshotPendingTransaction(event.getTransactionId());
     }
 
     @Override
