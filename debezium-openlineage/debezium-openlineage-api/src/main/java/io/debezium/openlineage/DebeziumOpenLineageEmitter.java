@@ -5,6 +5,8 @@
  */
 package io.debezium.openlineage;
 
+import static io.debezium.openlineage.OpenLineageConfig.OPEN_LINEAGE_INTEGRATION_ENABLED;
+
 import java.util.List;
 import java.util.Map;
 import java.util.ServiceLoader;
@@ -43,6 +45,8 @@ public class DebeziumOpenLineageEmitter {
     // Thread-safe map to store emitters per connector
     private static final ConcurrentHashMap<String, LineageEmitter> emitters = new ConcurrentHashMap<>();
 
+    private static final NoOpLineageEmitter noOpLineageEmitter = new NoOpLineageEmitter();
+
     /**
      * Initializes the lineage emitter with the given configuration for a specific connector.
      * <p>
@@ -54,6 +58,10 @@ public class DebeziumOpenLineageEmitter {
      * @param connectorTypeName The name of the connector used for event attribution
      */
     public static void init(Map<String, String> configuration, String connectorTypeName) {
+        if (isOpenLineageDisabled(configuration)) {
+            LOGGER.debug("NoOpLineageEmitter");
+            return;
+        }
 
         LOGGER.debug("Calling init for connector {} and config {}", connectorTypeName, configuration);
 
@@ -153,10 +161,17 @@ public class DebeziumOpenLineageEmitter {
     }
 
     private static LineageEmitter getEmitter(ConnectorContext connectorContext) {
+        if (isOpenLineageDisabled(connectorContext.config())) {
+            return noOpLineageEmitter;
+        }
         LineageEmitter emitter = emitters.get(connectorContext.toEmitterKey());
         if (emitter == null) {
             throw new IllegalStateException("DebeziumOpenLineageEmitter not initialized for connector " + connectorContext + ". Call init() first.");
         }
         return emitter;
+    }
+
+    private static boolean isOpenLineageDisabled(Map<String, String> configuration) {
+        return !Boolean.parseBoolean(configuration.get(OPEN_LINEAGE_INTEGRATION_ENABLED));
     }
 }
