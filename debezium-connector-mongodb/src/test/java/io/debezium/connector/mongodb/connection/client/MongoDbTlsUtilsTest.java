@@ -10,11 +10,18 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
+import java.io.ByteArrayInputStream;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.KeyPairGenerator;
+import java.security.KeyStore;
+import java.security.cert.Certificate;
+import java.security.cert.CertificateFactory;
 import java.util.Base64;
+import java.util.List;
 import java.util.Optional;
+import java.util.Properties;
 
 import org.bouncycastle.asn1.pkcs.PrivateKeyInfo;
 import org.junit.Rule;
@@ -78,6 +85,57 @@ public class MongoDbTlsUtilsTest {
     }
 
     @Test
+    public void splitsRawQueryLikeMongoDbConnectionString() {
+        assertEquals(
+                List.of("tls=true", "tlsCAFile=%2Ftmp%2Fca%3Bprod.pem", "appName=rising=wave"),
+                MongoDbTlsUtils.splitQueryOptions(
+                        "tls=true&&tlsCAFile=%2Ftmp%2Fca%3Bprod.pem;appName=rising=wave;" + ";"));
+    }
+
+    @Test
+    public void handlesCaseInsensitiveTlsFileOptionsAndFragments() {
+        String connectionString = "mongodb://localhost/?TLSCAFILE=%2Fetc%2Fmongo%2Fca.pem"
+                + "&appName=risingwave&TlsCertificateKeyFile=%2Fetc%2Fmongo%2Fclient.pem"
+                + "#fragment";
+
+        var tlsFiles = MongoDbTlsUtils.tlsFiles(connectionString);
+
+        assertEquals(Path.of("/etc/mongo/ca.pem"), tlsFiles.caFile().orElseThrow());
+        assertEquals(Path.of("/etc/mongo/client.pem"), tlsFiles.certificateKeyFile().orElseThrow());
+        assertEquals(
+                "mongodb://localhost/?appName=risingwave#fragment",
+                MongoDbTlsUtils.withoutTlsFileOptions(connectionString));
+    }
+
+    @Test
+    public void rejectsDuplicateTlsFileOptions() {
+        var error = assertThrows(
+                IllegalArgumentException.class,
+                () -> MongoDbTlsUtils.tlsFiles(
+                        "mongodb://localhost/?tlsCAFile=%2Fca.pem&TLSCAFILE=%2Fother-ca.pem"));
+
+        assertTrue(error.getMessage().contains("must not be specified more than once"));
+    }
+
+    @Test
+    public void rejectsEmptyTlsFileOptions() {
+        var error = assertThrows(
+                IllegalArgumentException.class,
+                () -> MongoDbTlsUtils.tlsFiles("mongodb://localhost/?tlsCertificateKeyFile="));
+
+        assertTrue(error.getMessage().contains("must not be empty"));
+    }
+
+    @Test
+    public void rejectsInvalidPercentEncoding() {
+        var error = assertThrows(
+                IllegalArgumentException.class,
+                () -> MongoDbTlsUtils.tlsFiles("mongodb://localhost/?tlsCAFile=%ZZ"));
+
+        assertTrue(error.getMessage().contains("Invalid percent-encoding"));
+    }
+
+    @Test
     public void clientFactoryConsumesPemOptionsDirectlyFromConnectionString() throws Exception {
         Path caFile = temporaryFolder.newFile("factory-ca.pem").toPath();
         Files.writeString(caFile, TEST_CERTIFICATE);
@@ -103,6 +161,17 @@ public class MongoDbTlsUtilsTest {
                 new MongoDbTlsUtils.TlsFiles(Optional.of(caFile), Optional.empty()));
 
         assertNotNull(sslContext.getSocketFactory());
+    }
+
+    @Test
+    public void createsSslContextFromConnectionStringPem() throws Exception {
+        Path caFile = writeCaPem("connection-string-ca.pem");
+
+        var sslContext = MongoDbTlsUtils.createTlsSslContext("mongodb://localhost/?tlsCAFile=" + caFile)
+                .orElseThrow();
+
+        assertNotNull(sslContext.getSocketFactory());
+        assertTrue(sslContext.getProtocol().startsWith("TLS"));
     }
 
     @Test
@@ -139,12 +208,102 @@ public class MongoDbTlsUtilsTest {
         assertClientPemCreatesSslContext(clientPem);
     }
 
+    @Test
+    public void combinesPemTrustWithDebeziumKeyStore() throws Exception {
+        Path caFile = writeCaPem("ca.pem");
+        Path keyStore = writeKeyStore("client.p12");
+
+        var managers = MongoDbTlsUtils.createTlsManagers(
+                new MongoDbTlsUtils.TlsFiles(Optional.of(caFile), Optional.empty()),
+                connectorConfig(keyStore, null));
+
+        assertNotNull(managers.keyManagers());
+        assertNotNull(managers.trustManagers());
+    }
+
+    @Test
+    public void combinesPemKeyWithDebeziumTrustStore() throws Exception {
+        Path clientPem = writeClientPem("client.pem");
+        Path trustStore = writeTrustStore("trust.p12");
+
+        var managers = MongoDbTlsUtils.createTlsManagers(
+                new MongoDbTlsUtils.TlsFiles(Optional.empty(), Optional.of(clientPem)),
+                connectorConfig(null, trustStore));
+
+        assertNotNull(managers.keyManagers());
+        assertNotNull(managers.trustManagers());
+    }
+
+    @Test
+    public void rejectsPemAndDebeziumKeyStoreForSameManagerSide() throws Exception {
+        Path clientPem = writeClientPem("client.pem");
+        Path keyStore = writeKeyStore("client.p12");
+        var connectorConfig = connectorConfig(keyStore, null);
+
+        var error = assertThrows(
+                IllegalArgumentException.class,
+                () -> MongoDbTlsUtils.createTlsManagers(
+                        new MongoDbTlsUtils.TlsFiles(Optional.empty(), Optional.of(clientPem)),
+                        connectorConfig));
+
+        assertTrue(error.getMessage().contains("both tlsCertificateKeyFile"));
+    }
+
+    @Test
+    public void rejectsPemAndDebeziumTrustStoreForSameManagerSide() throws Exception {
+        Path caFile = writeCaPem("ca.pem");
+        Path trustStore = writeTrustStore("trust.p12");
+        var connectorConfig = connectorConfig(null, trustStore);
+
+        var error = assertThrows(
+                IllegalArgumentException.class,
+                () -> MongoDbTlsUtils.createTlsManagers(
+                        new MongoDbTlsUtils.TlsFiles(Optional.of(caFile), Optional.empty()),
+                        connectorConfig));
+
+        assertTrue(error.getMessage().contains("both tlsCAFile"));
+    }
+
+    @Test
+    public void rejectsTlsCaFileWhenTlsIsDisabled() throws Exception {
+        Path caFile = writeCaPem("ca.pem");
+
+        var error = assertThrows(
+                IllegalArgumentException.class,
+                () -> MongoDbTlsUtils.createTlsSslContext("mongodb://localhost/?tls=false&tlsCAFile=" + caFile));
+
+        assertTrue(error.getMessage().contains("TLS is disabled"));
+    }
+
+    @Test
+    public void rejectsClientCertificatePemWithoutPrivateKey() throws Exception {
+        Path certificateKeyFile = writeCaPem("client.pem");
+
+        var error = assertThrows(
+                IllegalArgumentException.class,
+                () -> MongoDbTlsUtils.createTlsSslContext(
+                        "mongodb://localhost/?tlsCertificateKeyFile=" + certificateKeyFile));
+
+        assertTrue(error.getMessage().contains("private key"));
+    }
+
     private void assertClientPemCreatesSslContext(Path clientPem) {
         var sslContext = MongoDbTlsUtils.createTlsSslContext(
                 "mongodb://localhost/?tls=true",
                 new MongoDbTlsUtils.TlsFiles(Optional.empty(), Optional.of(clientPem)));
 
         assertNotNull(sslContext.getSocketFactory());
+    }
+
+    private Path writeCaPem(String fileName) throws Exception {
+        Path path = temporaryFolder.newFile(fileName).toPath();
+        Files.writeString(path, TEST_CERTIFICATE);
+        return path;
+    }
+
+    private Path writeClientPem(String fileName) throws Exception {
+        var keyPair = KeyPairGenerator.getInstance("RSA").generateKeyPair();
+        return writeClientPem(fileName, "PRIVATE KEY", keyPair.getPrivate().getEncoded());
     }
 
     private Path writeClientPem(String fileName, String keyLabel, byte[] key) throws Exception {
@@ -157,5 +316,52 @@ public class MongoDbTlsUtilsTest {
                         + privateKey
                         + "\n-----END " + keyLabel + "-----\n");
         return path;
+    }
+
+    private Path writeKeyStore(String fileName) throws Exception {
+        char[] password = "password".toCharArray();
+        var keyPair = KeyPairGenerator.getInstance("RSA").generateKeyPair();
+        KeyStore keyStore = KeyStore.getInstance("PKCS12");
+        keyStore.load(null, password);
+        keyStore.setKeyEntry("client", keyPair.getPrivate(), password, new Certificate[]{ testCertificate() });
+        Path path = temporaryFolder.newFile(fileName).toPath();
+        try (var output = Files.newOutputStream(path)) {
+            keyStore.store(output, password);
+        }
+        return path;
+    }
+
+    private Path writeTrustStore(String fileName) throws Exception {
+        char[] password = "password".toCharArray();
+        KeyStore trustStore = KeyStore.getInstance("PKCS12");
+        trustStore.load(null, password);
+        trustStore.setCertificateEntry("ca", testCertificate());
+        Path path = temporaryFolder.newFile(fileName).toPath();
+        try (var output = Files.newOutputStream(path)) {
+            trustStore.store(output, password);
+        }
+        return path;
+    }
+
+    private Certificate testCertificate() throws Exception {
+        return CertificateFactory.getInstance("X.509")
+                .generateCertificate(new ByteArrayInputStream(TEST_CERTIFICATE.getBytes(StandardCharsets.US_ASCII)));
+    }
+
+    private MongoDbConnectorConfig connectorConfig(Path keyStore, Path trustStore) {
+        var properties = new Properties();
+        properties.setProperty("mongodb.connection.string", "mongodb://localhost/?tls=true");
+        properties.setProperty("mongodb.ssl.enabled", "true");
+        if (keyStore != null) {
+            properties.setProperty("mongodb.ssl.keystore", keyStore.toString());
+            properties.setProperty("mongodb.ssl.keystore.password", "password");
+            properties.setProperty("mongodb.ssl.keystore.type", "PKCS12");
+        }
+        if (trustStore != null) {
+            properties.setProperty("mongodb.ssl.truststore", trustStore.toString());
+            properties.setProperty("mongodb.ssl.truststore.password", "password");
+            properties.setProperty("mongodb.ssl.truststore.type", "PKCS12");
+        }
+        return new MongoDbConnectorConfig(Configuration.from(properties));
     }
 }
