@@ -72,6 +72,23 @@ public interface StreamingChangeEventSource<P extends Partition, O extends Offse
     default void commitOffset(Map<String, ?> partition, Map<String, ?> offset) {
     }
 
+    /**
+     * Sets the callback that reports the streaming connection as established. Sources that only know
+     * this once streaming has really connected keep the callback and invoke it later. By default the
+     * connection is reported right away.
+     */
+    default void setOnConnectedCallback(Runnable callback) {
+        callback.run();
+    }
+
+    /**
+     * Aborts the source's connections from another thread, so that a source thread blocked in I/O that
+     * ignores {@link Thread#interrupt()} can unwind. Called by the coordinator only after a graceful stop
+     * and {@code shutdownNow()} have both timed out.
+     */
+    default void forceCloseConnection() {
+    }
+
     default O getOffsetContext() {
         return null;
     }

@@ -139,6 +139,7 @@ public class PostgresStreamingChangeEventSource
     /**
      * Set a callback to be invoked once the replication connection is truly established.
      */
+    @Override
     public void setOnConnectedCallback(Runnable callback) {
         this.onConnectedCallback = callback;
     }
@@ -163,6 +164,7 @@ public class PostgresStreamingChangeEventSource
      * thread's blocked socket read/write to throw {@code IOException} and release the {@code
      * ResourceLock}.
      */
+    @Override
     public void forceCloseConnection() {
         LOGGER.warn("Force-aborting PG connections to unblock wedged native I/O");
         Executor abortExecutor = Runnable::run;
