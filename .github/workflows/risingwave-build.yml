@@ -1,0 +1,59 @@
+name: RisingWave build
+
+on:
+  pull_request:
+    branches:
+      - v3.2.4.rw
+  push:
+    branches:
+      - v3.2.4.rw
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  MODULES: debezium-embedded,debezium-connector-mysql,debezium-connector-postgres,debezium-connector-mongodb,debezium-connector-sqlserver,debezium-connector-oracle
+
+jobs:
+  build:
+    name: Build and unit test
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: maven
+
+      - name: Check formatting and style
+        run: >
+          ./mvnw -B -ntp -pl "$MODULES" -am
+          process-test-sources checkstyle:checkstyle
+          -Dformat.formatter.goal=validate
+          -Dformat.imports.goal=check
+
+      - name: Build and run unit tests
+        run: >
+          ./mvnw -B -ntp -pl "$MODULES" -am
+          package
+          -DskipITs
+          -Dformat.skip=true
+          -Dcheckstyle.skip=true
+
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: surefire-reports
+          path: "**/target/surefire-reports/"
+          if-no-files-found: ignore
