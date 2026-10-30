@@ -164,6 +164,7 @@ public class SqlServerStreamingChangeEventSource implements StreamingChangeEvent
         this.checkAgent = true;
     }
 
+    @Override
     public void setOnConnectedCallback(Runnable callback) {
         this.onConnectedCallback = callback;
     }
@@ -181,6 +182,7 @@ public class SqlServerStreamingChangeEventSource implements StreamingChangeEvent
      * iteration so this method does not acquire the {@link SqlServerConnection} monitor, which may
      * itself be held by a wedged synchronized JDBC operation.
      */
+    @Override
     public void forceCloseConnection() {
         LOGGER.warn("Force-aborting SQL Server connections to unblock wedged native I/O");
         abortConnection(rawDataConnection, "data");

@@ -339,26 +339,7 @@ public class ChangeEventSourceCoordinator<P extends Partition, O extends OffsetC
         streamingSource = changeEventSourceFactory.getStreamingChangeEventSource();
         eventDispatcher.setEventListener(streamingMetrics);
 
-        boolean deferConnectedSignal = false;
-        if (streamingSource instanceof io.debezium.connector.postgresql.PostgresStreamingChangeEventSource) {
-            io.debezium.connector.postgresql.PostgresStreamingChangeEventSource pgSource = (io.debezium.connector.postgresql.PostgresStreamingChangeEventSource) streamingSource;
-            pgSource.setOnConnectedCallback(() -> streamingConnected(true));
-            deferConnectedSignal = true;
-        }
-        else if (streamingSource instanceof io.debezium.connector.mysql.MySqlStreamingChangeEventSource) {
-            io.debezium.connector.mysql.MySqlStreamingChangeEventSource mysqlSource = (io.debezium.connector.mysql.MySqlStreamingChangeEventSource) streamingSource;
-            mysqlSource.setOnConnectedCallback(() -> streamingConnected(true));
-            deferConnectedSignal = true;
-        }
-        else if (streamingSource instanceof io.debezium.connector.sqlserver.SqlServerStreamingChangeEventSource) {
-            io.debezium.connector.sqlserver.SqlServerStreamingChangeEventSource sqlServerSource = (io.debezium.connector.sqlserver.SqlServerStreamingChangeEventSource) streamingSource;
-            sqlServerSource.setOnConnectedCallback(() -> streamingConnected(true));
-            deferConnectedSignal = true;
-        }
-
-        if (!deferConnectedSignal) {
-            streamingConnected(true);
-        }
+        streamingSource.setOnConnectedCallback(() -> streamingConnected(true));
 
         streamingSource.init(offsetContext);
 
@@ -393,11 +374,8 @@ public class ChangeEventSourceCoordinator<P extends Partition, O extends OffsetC
     }
 
     private void forceCloseStreamingSourceConnection() {
-        if (streamingSource instanceof io.debezium.connector.postgresql.PostgresStreamingChangeEventSource) {
-            ((io.debezium.connector.postgresql.PostgresStreamingChangeEventSource) streamingSource).forceCloseConnection();
-        }
-        if (streamingSource instanceof io.debezium.connector.sqlserver.SqlServerStreamingChangeEventSource) {
-            ((io.debezium.connector.sqlserver.SqlServerStreamingChangeEventSource) streamingSource).forceCloseConnection();
+        if (streamingSource != null) {
+            streamingSource.forceCloseConnection();
         }
         // MySQL (BinaryLogClient) and MongoDB (cursor) are not affected.
     }

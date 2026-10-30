@@ -60,6 +60,7 @@ public class MySqlStreamingChangeEventSource extends BinlogStreamingChangeEventS
         this.connectorConfig = connectorConfig;
     }
 
+    @Override
     public void setOnConnectedCallback(Runnable callback) {
         this.onConnectedCallback = callback;
     }
