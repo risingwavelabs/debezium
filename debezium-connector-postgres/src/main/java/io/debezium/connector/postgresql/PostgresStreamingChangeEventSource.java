@@ -577,7 +577,10 @@ public class PostgresStreamingChangeEventSource
 
                         @Override
                         public boolean includeSchemaChange() {
-                            return connectorConfig.includeSchemaChangeRecords();
+                            // This pass only locates the resume LSN. Relation metadata is
+                            // replayed after reconnect, where normal processing must still
+                            // dispatch real schema changes made while the connector was offline.
+                            return false;
                         }
                         /* patched code */
                     });
