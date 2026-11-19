@@ -182,11 +182,6 @@ public class OracleOffsetContext extends CommonOffsetContext<SourceInfo> {
         if (getSnapshot().isPresent()) {
             result.put(SourceInfo.SNAPSHOT_KEY, getSnapshot().get().toString());
             result.put(SNAPSHOT_COMPLETED_KEY, snapshotCompleted);
-
-            final String encodedPendingTransactions = getEncodedSnapshotPendingTransactions();
-            if (!Strings.isNullOrEmpty(encodedPendingTransactions)) {
-                result.put(SNAPSHOT_PENDING_TRANSACTIONS_KEY, encodedPendingTransactions);
-            }
         }
 
         if (sourceInfo.getLcrPosition() != null) {
@@ -205,6 +200,11 @@ public class OracleOffsetContext extends CommonOffsetContext<SourceInfo> {
 
         if (snapshotScn != null && !snapshotScn.isNull()) {
             result.put(SNAPSHOT_SCN_KEY, snapshotScn.toString());
+        }
+
+        final String encodedPendingTransactions = getEncodedSnapshotPendingTransactions();
+        if (!Strings.isNullOrEmpty(encodedPendingTransactions)) {
+            result.put(SNAPSHOT_PENDING_TRANSACTIONS_KEY, encodedPendingTransactions);
         }
 
         if (sourceInfo.getCommitScn() != null) {
@@ -292,6 +292,12 @@ public class OracleOffsetContext extends CommonOffsetContext<SourceInfo> {
 
     public void setSnapshotPendingTransactions(Map<String, Scn> snapshotPendingTransactions) {
         this.snapshotPendingTransactions = snapshotPendingTransactions;
+    }
+
+    public void removeSnapshotPendingTransaction(String transactionId) {
+        if (snapshotPendingTransactions != null && !snapshotPendingTransactions.isEmpty()) {
+            snapshotPendingTransactions.remove(transactionId);
+        }
     }
 
     public void setTransactionId(String transactionId) {
