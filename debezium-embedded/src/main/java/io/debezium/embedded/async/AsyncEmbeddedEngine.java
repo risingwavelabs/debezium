@@ -121,6 +121,7 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
     private final AtomicReference<Throwable> shutdownError = new AtomicReference<>();
     private final AtomicReference<Throwable> shutdownWaitError = new AtomicReference<>();
     private final List<TaskCleanup> taskCleanups = new CopyOnWriteArrayList<>();
+    private volatile boolean taskCreationInProgress;
     // A latch to make sure close() method finishes before we call completion callback, see also DBZ-7496.
     private final CountDownLatch shutDownLatch = new CountDownLatch(1);
     private Signaler signaler;
@@ -214,8 +215,16 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
             connectorCallback.ifPresent(DebeziumEngine.ConnectorCallback::connectorStarted);
 
             LOGGER.debug("Creating source tasks.");
-            setEngineState(State.INITIALIZING, State.CREATING_TASKS);
-            createSourceTasks(connector, tasks);
+            // Publish pending work before entering the phase that can construct tasks.
+            // A concurrent close may finish before a blocked constructor publishes its record.
+            taskCreationInProgress = true;
+            try {
+                setEngineState(State.INITIALIZING, State.CREATING_TASKS);
+                createSourceTasks(connector, tasks);
+            }
+            finally {
+                taskCreationInProgress = false;
+            }
 
             LOGGER.debug("Starting source tasks.");
             setEngineState(State.CREATING_TASKS, State.STARTING_TASKS);
@@ -748,12 +757,12 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
     }
 
     /**
-     * Whether shutdown is still running or task cleanup remains unfinished/retryable.
+     * Whether shutdown or task creation is still running, or task cleanup remains unfinished/retryable.
      * Historical commit, converter, connector and offset-store errors do not imply pending work:
      * task-stop retries cannot repair those failures, which remain in {@link #getShutdownFailure()}.
      */
     public boolean hasPendingCleanup() {
-        if (shutDownLatch.getCount() != 0) {
+        if (shutDownLatch.getCount() != 0 || taskCreationInProgress) {
             return true;
         }
         for (TaskCleanup cleanup : taskCleanups) {
