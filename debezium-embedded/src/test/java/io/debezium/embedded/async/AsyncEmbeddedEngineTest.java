@@ -449,14 +449,14 @@ public class AsyncEmbeddedEngineTest {
 
     @Test
     @FixFor("DBZ-2534")
-    public void testCannotStopWhileTasksAreStarting() throws Exception {
+    public void testCanStopWhileTasksAreStarting() throws Exception {
         final Properties props = new Properties();
         props.put(EmbeddedEngineConfig.ENGINE_NAME.name(), "testing-connector");
         props.setProperty(ConnectorConfig.TASKS_MAX_CONFIG, "1");
         props.put(EmbeddedEngineConfig.CONNECTOR_CLASS.name(), AsyncEmbeddedEngineTest.WaitInTaskStartConnector.class.getName());
         props.put(StandaloneConfig.OFFSET_STORAGE_FILE_FILENAME_CONFIG, OFFSET_STORE_PATH.toAbsolutePath().toString());
         props.put(SimpleSourceConnector.BATCH_COUNT, 1);
-        props.put(AsyncEngineConfig.TASK_MANAGEMENT_TIMEOUT_MS, "10");
+        props.put(AsyncEngineConfig.TASK_MANAGEMENT_TIMEOUT_MS.name(), "100");
 
         CountDownLatch taskStartingLatch = new CountDownLatch(1);
         CountDownLatch enginStopLatch = new CountDownLatch(1);
@@ -475,21 +475,14 @@ public class AsyncEmbeddedEngineTest {
 
         WaitInTaskStartTask.taskStartingLatch.await(AbstractConnectorTest.waitTimeForEngine(), TimeUnit.SECONDS);
 
-        Exception error = null;
         try {
-            stopEngine();
+            engine.close();
         }
-        catch (Exception e) {
-            error = e;
+        finally {
+            WaitInTaskStartTask.continueLatch.countDown();
         }
-        assertThat(error).isNotNull();
-        assertThat(error).isInstanceOf(IllegalStateException.class);
-        assertThat(error.getMessage())
-                .isEqualTo("Cannot stop engine while tasks are starting, this may lead to leaked resource. Wait for the tasks to be fully started.");
-
-        WaitInTaskStartTask.continueLatch.countDown();
-        waitForTasksToStart(1);
-        stopEngine();
+        waitForEngineToStop();
+        Awaitility.await().atMost(5, TimeUnit.SECONDS).until(() -> !((AsyncEmbeddedEngine<?>) engine).hasPendingCleanup());
     }
 
     @Test

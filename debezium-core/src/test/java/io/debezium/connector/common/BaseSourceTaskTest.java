@@ -103,6 +103,28 @@ public class BaseSourceTaskTest {
     }
 
     @Test
+    public void commitFailureStillStopsTask() {
+        MyBaseSourceTask task = new MyBaseSourceTask() {
+            @Override
+            public void performCommit() {
+                throw new IllegalStateException("commit failed");
+            }
+        };
+        task.initialize(mock(SourceTaskContext.class));
+        task.start(new HashMap<>());
+        assertEquals("commit failed", assertThrows(IllegalStateException.class, task::stop).getMessage());
+        assertEquals(1, task.stopCount.get());
+        assertEquals(DebeziumTaskState.STOPPED, task.getTaskState());
+    }
+
+    @Test
+    public void stopBeforeStartDoesNotRequireConfiguration() {
+        baseSourceTask.stop();
+        assertEquals(1, baseSourceTask.stopCount.get());
+        assertEquals(DebeziumTaskState.STOPPED, baseSourceTask.getTaskState());
+    }
+
+    @Test
     public void verifyContainsChangeDataMessages() {
         assertFalse(baseSourceTask.containsChangeDataMessages(null));
         assertFalse(baseSourceTask.containsChangeDataMessages(List.of()));

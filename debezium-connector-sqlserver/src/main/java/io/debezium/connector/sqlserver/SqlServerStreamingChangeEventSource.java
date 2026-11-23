@@ -180,10 +180,12 @@ public class SqlServerStreamingChangeEventSource implements StreamingChangeEvent
             return;
         }
 
+        Exception transportFailure = null;
         try {
             closeTcpTransport(connection);
         }
         catch (Exception e) {
+            transportFailure = e;
             LOGGER.warn("Exception while force-closing SQL Server {} TCP transport", connectionName, e);
         }
 
@@ -191,7 +193,10 @@ public class SqlServerStreamingChangeEventSource implements StreamingChangeEvent
             connection.abort(ABORT_EXECUTOR);
         }
         catch (Exception e) {
-            LOGGER.warn("Exception while aborting SQL Server {} connection", connectionName, e);
+            if (transportFailure != null && transportFailure != e) {
+                e.addSuppressed(transportFailure);
+            }
+            throw new org.apache.kafka.connect.errors.ConnectException("Failed to abort SQL Server " + connectionName + " connection", e);
         }
     }
 

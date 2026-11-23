@@ -91,6 +91,22 @@ public class SqlServerShutdownTest {
         }
     }
 
+    @Test(timeout = 10000)
+    public void failedAbortRemainsVisibleAndCanBeRetried() throws Exception {
+        SqlServerConnectorConfig config = new SqlServerConnectorConfig(Configuration.create()
+                .with("topic.prefix", "shutdown-test")
+                .with("database.names", "test")
+                .with("database.hostname", "localhost").build());
+        SqlServerConnection connection = new SqlServerConnection(config, null, Set.of(), true);
+        Connection raw = mock(Connection.class);
+        setField(JdbcConnection.class, connection, "conn", raw);
+        org.mockito.Mockito.doThrow(new SQLException("abort failed")).doNothing().when(raw).abort(any());
+        assertThrows(org.apache.kafka.connect.errors.ConnectException.class, connection::forceClose);
+        connection.forceClose();
+        verify(raw, org.mockito.Mockito.times(2)).abort(any());
+        assertThrows(SQLException.class, connection::connection);
+    }
+
     private void stopBlockedTask(boolean interrupt) throws Exception {
         SqlServerConnectorConfig config = new SqlServerConnectorConfig(Configuration.create()
                 .with("topic.prefix", "shutdown-test")

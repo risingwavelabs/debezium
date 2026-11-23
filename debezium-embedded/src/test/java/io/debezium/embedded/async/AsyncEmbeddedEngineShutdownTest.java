@@ -155,6 +155,8 @@ public class AsyncEmbeddedEngineShutdownTest {
             close.get(5, TimeUnit.SECONDS);
             run.get(5, TimeUnit.SECONDS);
             assertThat(reportedSuccess.get()).as("unfinished/failed shutdown must not be reported as success").isFalse();
+            org.awaitility.Awaitility.await().atMost(5, TimeUnit.SECONDS)
+                    .until(() -> !((AsyncEmbeddedEngine<?>) engine).hasPendingCleanup());
             assertThat(((AsyncEmbeddedEngine<?>) engine).getShutdownFailure()).hasMessage("connector cleanup failed");
         }
         finally {

@@ -460,9 +460,28 @@ public abstract class BaseSourceTask<P extends Partition, O extends OffsetContex
 
     @Override
     public final void stop() {
-        performCommit();
-        stop(false);
-        DebeziumOpenLineageEmitter.cleanup(DebeziumOpenLineageEmitter.connectorContext(config.asMap(), connectorName()));
+        Throwable commitFailure = null;
+        try {
+            performCommit();
+        }
+        catch (RuntimeException | Error e) {
+            commitFailure = e;
+            throw e;
+        }
+        finally {
+            try {
+                stop(false);
+                if (config != null) {
+                    DebeziumOpenLineageEmitter.cleanup(DebeziumOpenLineageEmitter.connectorContext(config.asMap(), connectorName()));
+                }
+            }
+            catch (RuntimeException | Error e) {
+                if (commitFailure == null) {
+                    throw e;
+                }
+                commitFailure.addSuppressed(e);
+            }
+        }
     }
 
     private void stop(boolean restart) {
@@ -521,7 +540,9 @@ public abstract class BaseSourceTask<P extends Partition, O extends OffsetContex
             }
             else {
                 setTaskState(DebeziumTaskState.STOPPED);
-                DebeziumOpenLineageEmitter.emit(DebeziumOpenLineageEmitter.connectorContext(config.asMap(), connectorName()), DebeziumTaskState.STOPPED);
+                if (config != null) {
+                    DebeziumOpenLineageEmitter.emit(DebeziumOpenLineageEmitter.connectorContext(config.asMap(), connectorName()), DebeziumTaskState.STOPPED);
+                }
             }
         }
         finally {
