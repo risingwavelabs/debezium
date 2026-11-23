@@ -24,6 +24,7 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import org.apache.kafka.connect.connector.Task;
 import org.apache.kafka.connect.data.Schema;
+import org.apache.kafka.connect.json.JsonConverter;
 import org.apache.kafka.connect.runtime.ConnectorConfig;
 import org.apache.kafka.connect.runtime.standalone.StandaloneConfig;
 import org.apache.kafka.connect.source.SourceRecord;
@@ -36,6 +37,8 @@ import org.junit.rules.TemporaryFolder;
 import io.debezium.connector.simple.SimpleSourceConnector;
 import io.debezium.embedded.KafkaConnectUtil;
 import io.debezium.engine.DebeziumEngine;
+import io.debezium.engine.format.Json;
+import io.debezium.engine.format.KeyValueHeaderChangeEventFormat;
 
 public class AsyncEmbeddedEngineShutdownTest {
     @Rule
@@ -223,6 +226,78 @@ public class AsyncEmbeddedEngineShutdownTest {
         }
         finally {
             RetryTask.release.countDown();
+            threads.shutdownNow();
+        }
+    }
+
+    public static class FailingCloseConverter extends JsonConverter {
+        static boolean failWithError;
+
+        @Override
+        public void close() {
+            if (failWithError) {
+                throw new AssertionError("header converter close failed");
+            }
+            throw new IllegalStateException("header converter close failed");
+        }
+    }
+
+    @Test(timeout = 10000)
+    public void converterCloseExceptionDoesNotBlockTaskCleanupRetry() throws Exception {
+        converterCloseFailure(false);
+    }
+
+    @Test(timeout = 10000)
+    public void converterCloseErrorDoesNotBlockTaskCleanupRetry() throws Exception {
+        converterCloseFailure(true);
+    }
+
+    private void converterCloseFailure(boolean failWithError) throws Exception {
+        FailingCloseConverter.failWithError = failWithError;
+        RetryTask.stops.set(0);
+        RetryTask.polling = new CountDownLatch(1);
+        RetryTask.release = new CountDownLatch(0);
+        var success = new AtomicReference<Boolean>();
+        var error = new AtomicReference<Throwable>();
+        Properties props = new Properties();
+        props.setProperty(ConnectorConfig.NAME_CONFIG, "converter-close-failure");
+        props.setProperty(ConnectorConfig.CONNECTOR_CLASS_CONFIG, RetryConnector.class.getName());
+        props.setProperty(StandaloneConfig.OFFSET_STORAGE_FILE_FILENAME_CONFIG,
+                temporaryFolder.newFolder().toPath().resolve("offsets").toString());
+        props.setProperty(AsyncEngineConfig.TASK_MANAGEMENT_TIMEOUT_MS.name(), "200");
+        props.setProperty("header.converter.class", FailingCloseConverter.class.getName());
+        props.setProperty("transforms", "close");
+        props.setProperty("transforms.close.type", AsyncEmbeddedEngineTest.CloseTestTransform.class.getName());
+        var engine = (AsyncEmbeddedEngine<?>) new AsyncEmbeddedEngine.AsyncEngineBuilder<>(
+                KeyValueHeaderChangeEventFormat.of(Json.class, Json.class, Json.class))
+                .using(props)
+                .using((ok, message, failure) -> {
+                    success.set(ok);
+                    error.set(failure);
+                })
+                .notifying((records, committer) -> {
+                }).build();
+        var threads = Executors.newSingleThreadExecutor();
+        try {
+            var run = threads.submit(engine);
+            assertThat(RetryTask.polling.await(5, TimeUnit.SECONDS)).isTrue();
+            engine.close();
+            run.get(5, TimeUnit.SECONDS);
+            assertThat(success.get()).isFalse();
+            assertThat(error.get()).isInstanceOf(failWithError ? AssertionError.class : IllegalStateException.class)
+                    .hasMessage("header converter close failed");
+            assertThat(error.get().getSuppressed()).extracting(Throwable::getMessage).contains("first stop failed");
+            assertThat(AsyncEmbeddedEngineTest.CloseTestTransform.wasClosed).isTrue();
+            assertThat(RetryTask.stops.get()).isEqualTo(1);
+
+            // The task retry must run, while the non-task converter failure remains visible.
+            assertThatThrownBy(engine::retryFailedTaskStops).isInstanceOf(java.io.IOException.class).hasCause(error.get());
+            assertThat(RetryTask.stops.get()).isEqualTo(2);
+            assertThat(engine.getShutdownFailure()).isSameAs(error.get());
+            assertThatThrownBy(engine::retryFailedTaskStops).isInstanceOf(java.io.IOException.class).hasCause(error.get());
+            assertThat(RetryTask.stops.get()).isEqualTo(2);
+        }
+        finally {
             threads.shutdownNow();
         }
     }

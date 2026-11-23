@@ -296,31 +296,37 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
      */
     private void close(final State stateBeforeStop) {
         try {
-            stopConnector(tasks, stateBeforeStop);
-        }
-        catch (Exception e) {
-            shutdownError.compareAndSet(null, e);
-            LOGGER.warn("Failed to stop connector properly: ", e);
-        }
-        if (headerConverter != null) {
             try {
-                headerConverter.close();
+                stopConnector(tasks, stateBeforeStop);
             }
-            catch (IOException e) {
-                shutdownError.compareAndSet(null, e);
-                LOGGER.warn("Failed to close header converter: ", e);
+            catch (Exception | Error e) {
+                shutdownError.updateAndGet(previous -> combineFailures(previous, e));
+                LOGGER.warn("Failed to stop connector properly: ", e);
+            }
+            if (headerConverter != null) {
+                try {
+                    headerConverter.close();
+                }
+                catch (Exception | Error e) {
+                    shutdownError.updateAndGet(previous -> combineFailures(previous, e));
+                    LOGGER.warn("Failed to close header converter: ", e);
+                }
+            }
+            if (transformations != null) {
+                try {
+                    transformations.close();
+                }
+                catch (Exception | Error e) {
+                    shutdownError.updateAndGet(previous -> combineFailures(previous, e));
+                    LOGGER.warn("Failed to close transformations: ", e);
+                }
             }
         }
-        if (transformations != null) {
-            try {
-                transformations.close();
-            }
-            catch (IOException e) {
-                shutdownError.compareAndSet(null, e);
-                LOGGER.warn("Failed to close transformations: ", e);
-            }
+        finally {
+            // This latch marks the end of the shutdown attempt, not successful cleanup.
+            // Even unchecked close failures must allow failed task stops to be retried.
+            shutDownLatch.countDown();
         }
-        shutDownLatch.countDown();
     }
 
     /**
