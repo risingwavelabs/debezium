@@ -8,13 +8,17 @@ package io.debezium.embedded.async;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -23,11 +27,14 @@ import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.runtime.ConnectorConfig;
 import org.apache.kafka.connect.runtime.standalone.StandaloneConfig;
 import org.apache.kafka.connect.source.SourceRecord;
+import org.apache.kafka.connect.storage.FileOffsetBackingStore;
+import org.apache.kafka.connect.util.Callback;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
 import io.debezium.connector.simple.SimpleSourceConnector;
+import io.debezium.embedded.KafkaConnectUtil;
 import io.debezium.engine.DebeziumEngine;
 
 public class AsyncEmbeddedEngineShutdownTest {
@@ -371,11 +378,64 @@ public class AsyncEmbeddedEngineShutdownTest {
 
     @Test(timeout = 10000)
     public void finalCommitErrorRemainsVisibleAfterSuccessfulTaskCleanup() throws Exception {
+        finalCommitFailure(CommitErrorConnector.class, Map.of(), AssertionError.class, "final commit failed");
+    }
+
+    public static class CommitExceptionConnector extends SimpleSourceConnector {
+        @Override
+        public Class<? extends Task> taskClass() {
+            return CommitExceptionTask.class;
+        }
+    }
+
+    public static class CommitExceptionTask extends CommitErrorTask {
+        @Override
+        public void commit() {
+            throw new IllegalStateException("final commit exception");
+        }
+    }
+
+    public static class FailedFlushStore extends FileOffsetBackingStore {
+        static boolean nullFuture;
+
+        public FailedFlushStore() {
+            super(KafkaConnectUtil.converterForOffsetStore());
+        }
+
+        @Override
+        public Future<Void> set(Map<ByteBuffer, ByteBuffer> values, Callback<Void> callback) {
+            var failure = new IllegalStateException("offset flush failed");
+            callback.onCompletion(failure, null);
+            return nullFuture ? null : CompletableFuture.failedFuture(failure);
+        }
+    }
+
+    @Test(timeout = 10000)
+    public void finalCommitExceptionRemainsVisibleAfterSuccessfulTaskCleanup() throws Exception {
+        finalCommitFailure(CommitExceptionConnector.class, Map.of(), IllegalStateException.class, "final commit exception");
+    }
+
+    @Test(timeout = 10000)
+    public void failedFinalFlushIsReported() throws Exception {
+        FailedFlushStore.nullFuture = false;
+        finalCommitFailure(CommitErrorConnector.class, Map.of("offset.storage", FailedFlushStore.class.getName()),
+                IllegalStateException.class, "offset flush failed");
+    }
+
+    @Test(timeout = 10000)
+    public void nullFinalFlushIsReported() throws Exception {
+        FailedFlushStore.nullFuture = true;
+        finalCommitFailure(CommitErrorConnector.class, Map.of("offset.storage", FailedFlushStore.class.getName()),
+                IllegalStateException.class, "offset flush failed");
+    }
+
+    private void finalCommitFailure(Class<?> connector, Map<String, String> overrides, Class<? extends Throwable> failureType, String message)
+            throws Exception {
         CommitErrorTask.stops.set(0);
         var consumed = new CountDownLatch(1);
         var success = new AtomicReference<Boolean>();
         var error = new AtomicReference<Throwable>();
-        var engine = (AsyncEmbeddedEngine<?>) build(CommitErrorConnector.class, (ok, message, failure) -> {
+        var engine = (AsyncEmbeddedEngine<?>) build(connector, (ok, completionMessage, failure) -> {
             success.set(ok);
             error.set(failure);
         }, (records, committer) -> {
@@ -384,7 +444,7 @@ public class AsyncEmbeddedEngineShutdownTest {
             }
             // Leave the final commit to shutdown, rather than committing the batch here.
             consumed.countDown();
-        });
+        }, overrides);
         var threads = Executors.newSingleThreadExecutor();
         try {
             var run = threads.submit(engine);
@@ -392,11 +452,137 @@ public class AsyncEmbeddedEngineShutdownTest {
             engine.close();
             run.get(5, TimeUnit.SECONDS);
             assertThat(success.get()).isFalse();
-            assertThat(error.get()).isInstanceOf(AssertionError.class).hasMessage("final commit failed");
+            assertThat(error.get()).isInstanceOf(failureType).hasMessage(message);
+            assertThat(engine.getShutdownFailure()).isSameAs(error.get());
+            assertThat(CommitErrorTask.stops.get()).isEqualTo(1);
+            assertThatThrownBy(engine::retryFailedTaskStops).isInstanceOf(java.io.IOException.class)
+                    .hasCause(error.get());
             assertThat(engine.getShutdownFailure()).isSameAs(error.get());
             assertThat(CommitErrorTask.stops.get()).isEqualTo(1);
         }
         finally {
+            threads.shutdownNow();
+        }
+    }
+
+    public static class NoOffsetsConnector extends SimpleSourceConnector {
+        @Override
+        public Class<? extends Task> taskClass() {
+            return NoOffsetsTask.class;
+        }
+    }
+
+    public static class NoOffsetsTask extends DebeziumAsyncEngineTestUtils.NoOpTask {
+        static CountDownLatch polling;
+
+        @Override
+        public List<SourceRecord> poll() throws InterruptedException {
+            polling.countDown();
+            return super.poll();
+        }
+
+        @Override
+        public void commit() {
+            throw new AssertionError("No offsets should mean no final commit");
+        }
+    }
+
+    @Test(timeout = 10000)
+    public void nothingToFlushIsSuccessfulShutdown() throws Exception {
+        NoOffsetsTask.polling = new CountDownLatch(1);
+        var success = new AtomicReference<Boolean>();
+        var error = new AtomicReference<Throwable>();
+        var engine = (AsyncEmbeddedEngine<?>) build(NoOffsetsConnector.class, (ok, message, failure) -> {
+            success.set(ok);
+            error.set(failure);
+        });
+        var threads = Executors.newSingleThreadExecutor();
+        try {
+            var run = threads.submit(engine);
+            assertThat(NoOffsetsTask.polling.await(5, TimeUnit.SECONDS)).isTrue();
+            engine.close();
+            run.get(5, TimeUnit.SECONDS);
+            assertThat(success.get()).isTrue();
+            assertThat(error.get()).isNull();
+            assertThat(engine.getShutdownFailure()).isNull();
+        }
+        finally {
+            threads.shutdownNow();
+        }
+    }
+
+    public static class LateStartConnector extends SimpleSourceConnector {
+        @Override
+        public Class<? extends Task> taskClass() {
+            return LateStartTask.class;
+        }
+    }
+
+    public static class LateStartTask extends DebeziumAsyncEngineTestUtils.NoOpTask {
+        static CountDownLatch entered;
+        static CountDownLatch release;
+        static CountDownLatch cleaned;
+        static AtomicBoolean resourceOpen = new AtomicBoolean();
+        static AtomicInteger stops = new AtomicInteger();
+        static boolean failStart;
+
+        @Override
+        public void start(Map<String, String> props) {
+            entered.countDown();
+            awaitIgnoringInterrupts(release);
+            resourceOpen.set(true);
+            if (failStart) {
+                throw new IllegalStateException("late startup failure");
+            }
+        }
+
+        @Override
+        public void stop() {
+            stops.incrementAndGet();
+            resourceOpen.set(false);
+            cleaned.countDown();
+        }
+    }
+
+    @Test(timeout = 10000)
+    public void cleanupWaitsForTimedOutStartupToFinish() throws Exception {
+        lateStartup(false);
+    }
+
+    @Test(timeout = 10000)
+    public void cleanupWaitsForTimedOutStartupToFail() throws Exception {
+        lateStartup(true);
+    }
+
+    private void lateStartup(boolean failStart) throws Exception {
+        LateStartTask.entered = new CountDownLatch(1);
+        LateStartTask.release = new CountDownLatch(1);
+        LateStartTask.cleaned = new CountDownLatch(1);
+        LateStartTask.resourceOpen.set(false);
+        LateStartTask.stops.set(0);
+        LateStartTask.failStart = failStart;
+        var success = new AtomicReference<Boolean>();
+        var engine = (AsyncEmbeddedEngine<?>) build(LateStartConnector.class, (ok, message, error) -> success.set(ok));
+        var threads = Executors.newSingleThreadExecutor();
+        try {
+            var run = threads.submit(engine);
+            assertThat(LateStartTask.entered.await(5, TimeUnit.SECONDS)).isTrue();
+            run.get(5, TimeUnit.SECONDS);
+            assertThat(success.get()).isFalse();
+            assertThat(engine.getShutdownFailure()).isNotNull();
+            assertThat(LateStartTask.stops.get()).isZero();
+            assertThatThrownBy(engine::retryFailedTaskStops).isInstanceOf(TimeoutException.class);
+            assertThat(LateStartTask.stops.get()).isZero();
+            LateStartTask.release.countDown();
+            // Cleanup must happen automatically after start() returns, without another retry.
+            assertThat(LateStartTask.cleaned.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(LateStartTask.resourceOpen.get()).isFalse();
+            engine.retryFailedTaskStops();
+            assertThat(engine.getShutdownFailure()).isNull();
+            assertThat(LateStartTask.stops.get()).isEqualTo(1);
+        }
+        finally {
+            LateStartTask.release.countDown();
             threads.shutdownNow();
         }
     }
@@ -409,6 +595,12 @@ public class AsyncEmbeddedEngineShutdownTest {
     private DebeziumEngine<SourceRecord> build(Class<?> connector, DebeziumEngine.CompletionCallback callback,
                                                DebeziumEngine.ChangeConsumer<SourceRecord> consumer)
             throws Exception {
+        return build(connector, callback, consumer, Map.of());
+    }
+
+    private DebeziumEngine<SourceRecord> build(Class<?> connector, DebeziumEngine.CompletionCallback callback,
+                                               DebeziumEngine.ChangeConsumer<SourceRecord> consumer, Map<String, String> overrides)
+            throws Exception {
         Properties props = new Properties();
         props.setProperty(ConnectorConfig.NAME_CONFIG, "review-37");
         props.setProperty(ConnectorConfig.TASKS_MAX_CONFIG, "1");
@@ -416,6 +608,7 @@ public class AsyncEmbeddedEngineShutdownTest {
         props.setProperty(StandaloneConfig.OFFSET_STORAGE_FILE_FILENAME_CONFIG,
                 temporaryFolder.newFolder().toPath().resolve("offsets").toString());
         props.setProperty(AsyncEngineConfig.TASK_MANAGEMENT_TIMEOUT_MS.name(), "200");
+        props.putAll(overrides);
         return new AsyncEmbeddedEngine.AsyncEngineBuilder<SourceRecord>()
                 .using(props).using(callback).notifying(consumer).build();
     }

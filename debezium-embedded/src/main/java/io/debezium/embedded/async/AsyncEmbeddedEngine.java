@@ -30,6 +30,7 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -427,6 +428,7 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
                     transformations);
             task.initialize(taskContext); // Initialize Kafka Connect source task
             tasks.add(new EngineSourceTask(task, taskContext)); // Create new DebeziumSourceTask
+            taskCleanups.add(new TaskCleanup(task));
         }
     }
 
@@ -442,7 +444,7 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
         final ExecutorCompletionService<Void> taskCompletionService = new ExecutorCompletionService(taskService);
         for (EngineSourceTask task : tasks) {
             taskCompletionService.submit(() -> {
-                task.connectTask().start(task.context().config());
+                taskCleanup(task).start(task.context().config());
                 return null;
             });
         }
@@ -646,21 +648,31 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
             LOGGER.debug("Stopping source connector tasks.");
             final ExecutorCompletionService<Void> taskCompletionService = new ExecutorCompletionService(cleanups);
             for (EngineSourceTask task : tasks) {
-                final TaskCleanup cleanup = new TaskCleanup(task.connectTask());
-                taskCleanups.add(cleanup);
+                final TaskCleanup cleanup = taskCleanup(task);
                 final long commitTimeout = Configuration.from(task.context().config()).getLong(EmbeddedEngineConfig.OFFSET_COMMIT_TIMEOUT_MS);
                 cleanup.attempt = taskCompletionService.submit(() -> {
-                    LOGGER.debug("Committing task's offset.");
+                    // A timeout/cancellation of the startup Future does not mean start() returned.
+                    // Keep this cleanup attempt pending until it can close all startup resources.
+                    boolean interrupted = cleanup.awaitStartup();
                     try {
-                        commitOffsets(task.context().offsetStorageWriter(), task.context().clock(), commitTimeout, task.connectTask());
-                    }
-                    catch (Exception | Error e) {
-                        shutdownError.compareAndSet(null, e);
-                        throw e;
+                        try {
+                            LOGGER.debug("Committing task's offset.");
+                            commitOffsets(task.context().offsetStorageWriter(), task.context().clock(), commitTimeout, task.connectTask(),
+                                    failure -> shutdownError.compareAndSet(null, failure));
+                        }
+                        catch (Exception | Error e) {
+                            shutdownError.compareAndSet(null, e);
+                            throw e;
+                        }
+                        finally {
+                            LOGGER.debug("Stopping Connect task.");
+                            cleanup.stop();
+                        }
                     }
                     finally {
-                        LOGGER.debug("Stopping Connect task.");
-                        cleanup.stop();
+                        if (interrupted) {
+                            Thread.currentThread().interrupt();
+                        }
                     }
                     return null;
                 });
@@ -787,8 +799,14 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
         });
     }
 
+    private TaskCleanup taskCleanup(EngineSourceTask task) {
+        return taskCleanups.stream().filter(cleanup -> cleanup.task == task.connectTask()).findFirst().orElseThrow();
+    }
+
     private static final class TaskCleanup {
         private final SourceTask task;
+        private final AtomicBoolean startupClaimed = new AtomicBoolean();
+        private final CountDownLatch startupFinished = new CountDownLatch(1);
         private volatile boolean stopped;
         private volatile Throwable failure;
         // Tracks actual cleanup completion, including the first attempt. A cancelled polling
@@ -799,7 +817,39 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
             this.task = task;
         }
 
+        private void start(Map<String, String> config) {
+            if (!startupClaimed.compareAndSet(false, true)) {
+                return; // Shutdown claimed a startup attempt that had not begun executing.
+            }
+            try {
+                task.start(config);
+            }
+            finally {
+                startupFinished.countDown();
+            }
+        }
+
+        private boolean awaitStartup() {
+            if (startupClaimed.compareAndSet(false, true)) {
+                // Prevent a queued startup attempt from opening resources after cleanup.
+                startupFinished.countDown();
+            }
+            boolean interrupted = false;
+            while (true) {
+                try {
+                    startupFinished.await();
+                    return interrupted;
+                }
+                catch (InterruptedException e) {
+                    // The engine wait is bounded; this daemon cleanup must still run when
+                    // an uninterruptible start() eventually finishes (successfully or not).
+                    interrupted = true;
+                }
+            }
+        }
+
         private void stop() {
+            boolean interrupted = awaitStartup();
             try {
                 task.stop();
                 failure = null;
@@ -808,6 +858,11 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
             catch (RuntimeException | Error e) {
                 failure = e;
                 throw e;
+            }
+            finally {
+                if (interrupted) {
+                    Thread.currentThread().interrupt();
+                }
             }
         }
     }
@@ -993,6 +1048,13 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
      */
     private static boolean commitOffsets(final OffsetStorageWriter offsetWriter, final io.debezium.util.Clock clock, final long commitTimeout, final SourceTask task)
             throws InterruptedException, TimeoutException {
+        return commitOffsets(offsetWriter, clock, commitTimeout, task, failure -> {
+        });
+    }
+
+    private static boolean commitOffsets(final OffsetStorageWriter offsetWriter, final io.debezium.util.Clock clock, final long commitTimeout,
+                                         final SourceTask task, final Consumer<Throwable> onFailure)
+            throws InterruptedException, TimeoutException {
         final long timeout = clock.currentTimeInMillis() + commitTimeout;
         if (!offsetWriter.beginFlush(commitTimeout, TimeUnit.MILLISECONDS)) {
             LOGGER.trace("No offset to be committed.");
@@ -1000,10 +1062,12 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
         }
 
         try {
-            final Future<Void> flush = offsetWriter.doFlush((Throwable error, Void result) -> {
-            });
+            final AtomicReference<Throwable> flushError = new AtomicReference<>();
+            final Future<Void> flush = offsetWriter.doFlush((Throwable error, Void result) -> flushError.set(error));
             if (flush == null) {
-                LOGGER.warn("Flushing process probably failed, please check previous log for more details.");
+                // Unlike beginFlush() returning false, a null flush means serialization failed.
+                Throwable failure = flushError.get();
+                onFailure.accept(failure != null ? failure : new IOException("Offset flush failed before submission"));
                 offsetWriter.cancelFlush();
                 return false;
             }
@@ -1018,6 +1082,7 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
         }
         catch (Exception e) {
             LOGGER.warn("Flush of the offsets failed, canceling the flush.", e);
+            onFailure.accept(unwrapExecutionException(e));
             offsetWriter.cancelFlush();
             return false;
         }
