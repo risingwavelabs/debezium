@@ -42,6 +42,7 @@ import io.debezium.util.Metronome;
 public class SqlServerChangeEventSourceCoordinator extends ChangeEventSourceCoordinator<SqlServerPartition, SqlServerOffsetContext> {
     private static final Logger LOGGER = LoggerFactory.getLogger(SqlServerChangeEventSourceCoordinator.class);
 
+    private final Runnable closeConnections;
     private final Clock clock;
     private final Duration pollInterval;
 
@@ -57,11 +58,17 @@ public class SqlServerChangeEventSourceCoordinator extends ChangeEventSourceCoor
                                                  Clock clock,
                                                  SignalProcessor<SqlServerPartition, SqlServerOffsetContext> signalProcessor,
                                                  NotificationService<SqlServerPartition, SqlServerOffsetContext> notificationService,
-                                                 SnapshotterService snapshotterService) {
+                                                 SnapshotterService snapshotterService, Runnable closeConnections) {
         super(previousOffsets, errorHandler, connectorType, connectorConfig, changeEventSourceFactory,
                 changeEventSourceMetricsFactory, eventDispatcher, schema, signalProcessor, notificationService, snapshotterService);
+        this.closeConnections = closeConnections;
         this.clock = clock;
         this.pollInterval = connectorConfig.getPollInterval();
+    }
+
+    @Override
+    protected void forceCloseSourceConnections() {
+        closeConnections.run();
     }
 
     public boolean firstStreamingIterationCompletedSuccessfully() {

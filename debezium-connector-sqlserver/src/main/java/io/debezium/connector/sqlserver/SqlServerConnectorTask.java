@@ -5,7 +5,6 @@
  */
 package io.debezium.connector.sqlserver;
 
-import java.sql.SQLException;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -169,7 +168,7 @@ public class SqlServerConnectorTask extends BaseSourceTask<SqlServerPartition, S
                 clock,
                 signalProcessor,
                 notificationService,
-                snapshotterService);
+                snapshotterService, this::forceCloseConnections);
 
         coordinator.start(taskContext, this.queue, metadataProvider);
 
@@ -205,26 +204,28 @@ public class SqlServerConnectorTask extends BaseSourceTask<SqlServerPartition, S
 
     @Override
     protected void doStop() {
+        // Never acquire a JDBC monitor here: coordinator shutdown may have been interrupted
+        // while a source still holds it. Abort both task-owned connections in every phase.
+        try {
+            forceCloseConnections();
+        }
+        finally {
+            if (schema != null) {
+                schema.close();
+            }
+        }
+    }
+
+    private void forceCloseConnections() {
         try {
             if (dataConnection != null) {
-                dataConnection.close();
+                dataConnection.forceClose();
             }
         }
-        catch (SQLException e) {
-            LOGGER.error("Exception while closing JDBC connection", e);
-        }
-
-        try {
+        finally {
             if (metadataConnection != null) {
-                metadataConnection.close();
+                metadataConnection.forceClose();
             }
-        }
-        catch (SQLException e) {
-            LOGGER.error("Exception while closing JDBC metadata connection", e);
-        }
-
-        if (schema != null) {
-            schema.close();
         }
     }
 

@@ -100,20 +100,11 @@ public class SqlServerStreamingChangeEventSource implements StreamingChangeEvent
     private final SqlServerConnection dataConnection;
 
     /**
-     * Cached and refreshed by the source thread so emergency shutdown never needs to acquire the
-     * synchronized {@link SqlServerConnection} monitor.
-     */
-    private volatile Connection rawDataConnection;
-
-    /**
      * A separate connection for retrieving details of the schema changes; without it, adaptive buffering will not work.
      *
      * @link https://docs.microsoft.com/en-us/sql/connect/jdbc/using-adaptive-buffering?view=sql-server-2017#guidelines-for-using-adaptive-buffering
      */
     private final SqlServerConnection metadataConnection;
-
-    /** See {@link #rawDataConnection}. */
-    private volatile Connection rawMetadataConnection;
 
     private final EventDispatcher<SqlServerPartition, TableId> dispatcher;
     private final ErrorHandler errorHandler;
@@ -143,10 +134,11 @@ public class SqlServerStreamingChangeEventSource implements StreamingChangeEvent
         this.dataConnection = dataConnection;
         this.metadataConnection = metadataConnection;
         try {
-            refreshRawConnections();
+            dataConnection.connect();
+            metadataConnection.connect();
         }
         catch (SQLException e) {
-            throw new DebeziumException("Failed to cache initial SQL Server JDBC connections", e);
+            throw new DebeziumException("Failed to initialize SQL Server JDBC connections", e);
         }
         this.dispatcher = dispatcher;
         this.errorHandler = errorHandler;
@@ -169,26 +161,20 @@ public class SqlServerStreamingChangeEventSource implements StreamingChangeEvent
         this.onConnectedCallback = callback;
     }
 
-    /**
-     * Abort the underlying SQL Server connections from outside the source thread so an in-flight
-     * JDBC operation that does not respond to {@link Thread#interrupt()} is unblocked.
-     *
-     * <p>The coordinator invokes this only after graceful shutdown and {@code shutdownNow()} have
-     * both timed out. mssql-jdbc's normal close path first closes its SSL socket, which can wait
-     * for the same lock held by an encrypted socket read. This method therefore closes the
-     * underlying TCP socket directly before scheduling normal driver cleanup asynchronously.
-     * Closing a {@link Socket} is thread-safe and unblocks its current read without acquiring the
-     * driver's SSL or input-stream locks. The source thread refreshes the raw handles before each
-     * iteration so this method does not acquire the {@link SqlServerConnection} monitor, which may
-     * itself be held by a wedged synchronized JDBC operation.
-     */
     @Override
     public void forceCloseConnection() {
-        LOGGER.warn("Force-aborting SQL Server connections to unblock wedged native I/O");
-        abortConnection(rawDataConnection, "data");
-        abortConnection(rawMetadataConnection, "metadata");
+        try {
+            dataConnection.forceClose();
+        }
+        finally {
+            metadataConnection.forceClose();
+        }
     }
 
+    /**
+     * Close the TCP transport before asynchronous driver cleanup. Normal SSL close may wait for
+     * the lock held by a blocked reader, whereas closing the raw socket wakes that reader.
+     */
     static void abortConnection(Connection connection, String connectionName) {
         if (connection == null) {
             return;
@@ -228,11 +214,6 @@ public class SqlServerStreamingChangeEventSource implements StreamingChangeEvent
             throw new IllegalAccessException("Cannot access " + owner.getName() + "." + fieldName);
         }
         return field.get(target);
-    }
-
-    private void refreshRawConnections() throws SQLException {
-        rawDataConnection = dataConnection.connection();
-        rawMetadataConnection = metadataConnection.connection();
     }
 
     @Override
@@ -283,12 +264,6 @@ public class SqlServerStreamingChangeEventSource implements StreamingChangeEvent
             TxLogPosition lastProcessedPosition = streamingExecutionContext.getLastProcessedPosition();
 
             if (context.isRunning()) {
-                // JdbcConnection may transparently replace a closed connection. Refresh the raw
-                // handles from the source thread so emergency shutdown always aborts the
-                // connections used by this iteration without acquiring the JdbcConnection
-                // monitor.
-                refreshRawConnections();
-
                 commitTransaction();
                 final Lsn toLsn = getToLsn(dataConnection, databaseName, lastProcessedPosition, maxTransactionsPerIteration);
 

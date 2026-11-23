@@ -476,6 +476,8 @@ public abstract class BaseSourceTask<P extends Partition, O extends OffsetContex
                 LOGGER.info("Stopping down connector");
             }
 
+            Throwable stopFailure = null;
+            boolean interrupted = false;
             try {
                 if (coordinator != null) {
                     coordinator.stop();
@@ -483,12 +485,33 @@ public abstract class BaseSourceTask<P extends Partition, O extends OffsetContex
                 }
             }
             catch (InterruptedException e) {
+                interrupted = true;
                 Thread.interrupted();
                 LOGGER.error("Interrupted while stopping coordinator", e);
-                throw new ConnectException("Interrupted while stopping coordinator, failing the task");
+                ConnectException failure = new ConnectException("Interrupted while stopping coordinator, failing the task", e);
+                stopFailure = failure;
+                throw failure;
             }
-
-            doStop();
+            catch (RuntimeException | Error e) {
+                stopFailure = e;
+                throw e;
+            }
+            finally {
+                try {
+                    doStop();
+                }
+                catch (RuntimeException | Error e) {
+                    if (stopFailure == null) {
+                        throw e;
+                    }
+                    stopFailure.addSuppressed(e);
+                }
+                finally {
+                    if (interrupted) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+            }
 
             if (restart) {
                 setTaskState(DebeziumTaskState.RESTARTING);

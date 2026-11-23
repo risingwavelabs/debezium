@@ -116,6 +116,7 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
     private final List<Future<Void>> pollingFutures = new ArrayList<>();
     private final ExecutorService taskService;
     private final ExecutorService recordService;
+    private final AtomicReference<Throwable> shutdownError = new AtomicReference<>();
     // A latch to make sure close() method finishes before we call completion callback, see also DBZ-7496.
     private final CountDownLatch shutDownLatch = new CountDownLatch(1);
     private Signaler signaler;
@@ -294,6 +295,7 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
             stopConnector(tasks, stateBeforeStop);
         }
         catch (Exception e) {
+            shutdownError.compareAndSet(null, e);
             LOGGER.warn("Failed to stop connector properly: ", e);
         }
         if (headerConverter != null) {
@@ -352,6 +354,13 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
         LOGGER.info("Engine is stopped.");
         setEngineState(State.STOPPING, State.STOPPED);
         LOGGER.debug("Calling completion handler.");
+        Throwable cleanupError = shutdownError.get();
+        if (exitError == null) {
+            exitError = cleanupError;
+        }
+        else if (cleanupError != null && cleanupError != exitError) {
+            exitError.addSuppressed(cleanupError);
+        }
         callCompletionHandler(exitError);
     }
 
@@ -630,9 +639,13 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
                 final long commitTimeout = Configuration.from(task.context().config()).getLong(EmbeddedEngineConfig.OFFSET_COMMIT_TIMEOUT_MS);
                 taskCompletionService.submit(() -> {
                     LOGGER.debug("Committing task's offset.");
-                    commitOffsets(task.context().offsetStorageWriter(), task.context().clock(), commitTimeout, task.connectTask());
-                    LOGGER.debug("Stopping Connect task.");
-                    task.connectTask().stop();
+                    try {
+                        commitOffsets(task.context().offsetStorageWriter(), task.context().clock(), commitTimeout, task.connectTask());
+                    }
+                    finally {
+                        LOGGER.debug("Stopping Connect task.");
+                        task.connectTask().stop();
+                    }
                     return null;
                 });
             }
@@ -661,9 +674,11 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
             taskService.shutdown();
         }
         catch (InterruptedException e) {
+            shutdownError.compareAndSet(null, e);
             LOGGER.warn("Stopping of the tasks was interrupted, shutting down immediately.");
         }
         catch (Exception e) {
+            shutdownError.compareAndSet(null, e);
             LOGGER.warn("Failure during stopping tasks, stopping them immediately. Failed with ", e);
         }
         finally {

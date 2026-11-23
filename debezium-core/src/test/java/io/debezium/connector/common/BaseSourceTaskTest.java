@@ -7,7 +7,10 @@ package io.debezium.connector.common;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertSame;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -23,6 +26,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.SchemaBuilder;
 import org.apache.kafka.connect.data.Struct;
+import org.apache.kafka.connect.errors.ConnectException;
 import org.apache.kafka.connect.errors.RetriableException;
 import org.apache.kafka.connect.source.SourceRecord;
 import org.apache.kafka.connect.source.SourceTaskContext;
@@ -59,6 +63,31 @@ public class BaseSourceTaskTest {
         assertEquals(1, baseSourceTask.startCount.get());
         assertEquals(1, baseSourceTask.stopCount.get());
         verify(baseSourceTask.coordinator).stop();
+    }
+
+    @Test
+    public void verifyInterruptedCoordinatorStillStopsTask() throws InterruptedException {
+        baseSourceTask.start(new HashMap<>());
+        InterruptedException interrupted = new InterruptedException("stop interrupted");
+        doThrow(interrupted).when(baseSourceTask.coordinator).stop();
+        try {
+            ConnectException failure = assertThrows(ConnectException.class, baseSourceTask::stop);
+            assertSame(interrupted, failure.getCause());
+            assertEquals(1, baseSourceTask.stopCount.get());
+            assertTrue(Thread.currentThread().isInterrupted());
+        }
+        finally {
+            Thread.interrupted();
+        }
+    }
+
+    @Test
+    public void verifyFailedCoordinatorStillStopsTask() throws InterruptedException {
+        baseSourceTask.start(new HashMap<>());
+        IllegalStateException failure = new IllegalStateException("stop failed");
+        doThrow(failure).when(baseSourceTask.coordinator).stop();
+        assertSame(failure, assertThrows(IllegalStateException.class, baseSourceTask::stop));
+        assertEquals(1, baseSourceTask.stopCount.get());
     }
 
     @Test

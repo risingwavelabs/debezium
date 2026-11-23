@@ -921,8 +921,21 @@ public class JdbcConnection implements AutoCloseable {
         return conn;
     }
 
+    /**
+     * Returns the published connection without acquiring the JDBC monitor or opening a connection.
+     * Intended only for emergency shutdown while another thread is blocked in JDBC I/O.
+     */
+    protected Connection currentConnection() {
+        return conn;
+    }
+
+    /** Called immediately after publication, before any initialization queries. */
+    protected void connectionCreated() throws SQLException {
+    }
+
     private void establishConnection() throws SQLException {
         conn = factory.connect(JdbcConfiguration.adapt(config));
+        connectionCreated();
         if (!isConnected()) {
             throw new SQLException("Unable to obtain a JDBC connection");
         }

@@ -121,6 +121,8 @@ public class SqlServerConnection extends JdbcConnection {
 
     private static final String URL_PATTERN = "jdbc:sqlserver://${" + JdbcConfiguration.HOSTNAME + "}";
 
+    private volatile boolean forceClosed;
+
     private final SqlServerConnectorConfig config;
     private final boolean useSingleDatabase;
     private final String getAllChangesForTable;
@@ -291,14 +293,37 @@ public class SqlServerConnection extends JdbcConnection {
 
     @Override
     public synchronized Connection connection(boolean executeOnConnect) throws SQLException {
-        boolean connected = isConnected();
-        Connection connection = super.connection(executeOnConnect);
-
-        if (!connected) {
-            connection.setAutoCommit(false);
+        if (forceClosed) {
+            throw new SQLException("SQL Server connection has been stopped");
         }
+        try {
+            boolean connected = isConnected();
+            Connection connection = super.connection(executeOnConnect);
+            if (!connected) {
+                connection.setAutoCommit(false);
+            }
+            return connection;
+        }
+        finally {
+            // Cover a connection that was being established when forceClose() ran.
+            if (forceClosed) {
+                SqlServerStreamingChangeEventSource.abortConnection(currentConnection(), "task");
+            }
+        }
+    }
 
-        return connection;
+    @Override
+    protected void connectionCreated() throws SQLException {
+        if (forceClosed) {
+            SqlServerStreamingChangeEventSource.abortConnection(currentConnection(), "task");
+            throw new SQLException("SQL Server connection has been stopped");
+        }
+    }
+
+    /** Abort without waiting for the monitor held by an in-flight JDBC operation. */
+    public void forceClose() {
+        forceClosed = true;
+        SqlServerStreamingChangeEventSource.abortConnection(currentConnection(), "task");
     }
 
     /**

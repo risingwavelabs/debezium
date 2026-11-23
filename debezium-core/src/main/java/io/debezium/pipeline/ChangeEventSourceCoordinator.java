@@ -373,7 +373,8 @@ public class ChangeEventSourceCoordinator<P extends Partition, O extends OffsetC
         }
     }
 
-    private void forceCloseStreamingSourceConnection() {
+    /** Override for connectors that own connections before the streaming source is initialized. */
+    protected void forceCloseSourceConnections() {
         if (streamingSource != null) {
             streamingSource.forceCloseConnection();
         }
@@ -408,7 +409,7 @@ public class ChangeEventSourceCoordinator<P extends Partition, O extends OffsetC
                     // wedged commit throws SocketException, allowing the source thread to unwind
                     // and release upstream resources. See risingwavelabs/risingwave#26075 and
                     // #26081.
-                    forceCloseStreamingSourceConnection();
+                    forceCloseSourceConnections();
                     boolean forceCloseOk = executor.awaitTermination(shutdownWaitTimeout, TimeUnit.MILLISECONDS);
                     if (!forceCloseOk) {
                         LOGGER.warn("Source thread still not terminated after force-closing the connection; "
@@ -423,7 +424,10 @@ public class ChangeEventSourceCoordinator<P extends Partition, O extends OffsetC
                 // Clear interrupt flag so the forced termination is always attempted
                 Thread.interrupted();
                 blockingSnapshotExecutor.shutdownNow();
-                blockingSnapshotExecutor.awaitTermination(shutdownWaitTimeout, TimeUnit.MILLISECONDS);
+                if (!blockingSnapshotExecutor.awaitTermination(shutdownWaitTimeout, TimeUnit.MILLISECONDS)) {
+                    forceCloseSourceConnections();
+                    blockingSnapshotExecutor.awaitTermination(shutdownWaitTimeout, TimeUnit.MILLISECONDS);
+                }
             }
 
             Optional<SignalProcessor<P, O>> processor = getSignalProcessor(previousOffsets);
@@ -439,8 +443,22 @@ public class ChangeEventSourceCoordinator<P extends Partition, O extends OffsetC
             connectorConfig.getServiceRegistry().close();
         }
         finally {
-            snapshotMetrics.unregister();
-            streamingMetrics.unregister();
+            try {
+                // Interruption or another shutdown failure must not bypass emergency cleanup.
+                if (!executor.isTerminated() || !blockingSnapshotExecutor.isTerminated()) {
+                    executor.shutdownNow();
+                    blockingSnapshotExecutor.shutdownNow();
+                    forceCloseSourceConnections();
+                }
+            }
+            finally {
+                if (snapshotMetrics != null) {
+                    snapshotMetrics.unregister();
+                }
+                if (streamingMetrics != null) {
+                    streamingMetrics.unregister();
+                }
+            }
         }
     }
 
