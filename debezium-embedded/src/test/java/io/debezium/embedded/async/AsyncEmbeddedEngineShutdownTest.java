@@ -165,16 +165,15 @@ public class AsyncEmbeddedEngineShutdownTest {
         }
     }
 
-    public static class RetryConnector extends SimpleSourceConnector {
+    public static class FailStopConnector extends SimpleSourceConnector {
         @Override
         public Class<? extends Task> taskClass() {
-            return RetryTask.class;
+            return FailStopTask.class;
         }
     }
 
-    public static class RetryTask extends DebeziumAsyncEngineTestUtils.NoOpTask {
+    public static class FailStopTask extends DebeziumAsyncEngineTestUtils.NoOpTask {
         static CountDownLatch polling;
-        static CountDownLatch release;
         static AtomicInteger stops = new AtomicInteger();
 
         @Override
@@ -185,49 +184,34 @@ public class AsyncEmbeddedEngineShutdownTest {
 
         @Override
         public void stop() {
-            if (stops.incrementAndGet() == 1) {
-                throw new IllegalStateException("first stop failed");
-            }
-            boolean released = false;
-            while (!released) {
-                try {
-                    release.await();
-                    released = true;
-                }
-                catch (InterruptedException ignored) {
-                    // Model native cleanup that does not respond to interruption.
-                }
-            }
+            stops.incrementAndGet();
+            throw new IllegalStateException("task stop failed");
         }
     }
 
     @Test
-    public void timedOutTaskRetryIsNotRunConcurrently() throws Exception {
-        RetryTask.stops.set(0);
-        RetryTask.polling = new CountDownLatch(1);
-        RetryTask.release = new CountDownLatch(1);
-        CountDownLatch completed = new CountDownLatch(1);
-        AsyncEmbeddedEngine<?> engine = (AsyncEmbeddedEngine<?>) build(RetryConnector.class,
-                (success, message, error) -> completed.countDown());
+    public void failedStopCompletesCleanupAndNotifiesEarlyAndLateObservers() throws Exception {
+        FailStopTask.stops.set(0);
+        FailStopTask.polling = new CountDownLatch(1);
+        var engine = (AsyncEmbeddedEngine<?>) build(FailStopConnector.class, (success, message, error) -> {
+        });
+        var notifications = new AtomicInteger();
+        var observer = engine.cleanupCompletion().thenRun(notifications::incrementAndGet);
         var threads = Executors.newSingleThreadExecutor();
         try {
             var run = threads.submit(engine);
-            assertThat(RetryTask.polling.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(FailStopTask.polling.await(5, TimeUnit.SECONDS)).isTrue();
             engine.close();
-            assertThat(completed.await(5, TimeUnit.SECONDS)).isTrue();
             run.get(5, TimeUnit.SECONDS);
-            assertThat(engine.getShutdownFailure()).hasMessage("first stop failed");
-            assertThatThrownBy(engine::retryFailedTaskStops).isInstanceOf(TimeoutException.class);
-            assertThatThrownBy(engine::retryFailedTaskStops).isInstanceOf(TimeoutException.class);
-            assertThat(RetryTask.stops.get()).isEqualTo(2);
-            RetryTask.release.countDown();
-            engine.retryFailedTaskStops();
-            assertThat(engine.getShutdownFailure()).isNull();
-            engine.retryFailedTaskStops();
-            assertThat(RetryTask.stops.get()).isEqualTo(2);
+            observer.toCompletableFuture().get(5, TimeUnit.SECONDS);
+            assertThat(engine.getShutdownFailure()).hasMessage("task stop failed");
+            assertThat(engine.hasPendingCleanup()).isFalse();
+            engine.cleanupCompletion().thenRun(notifications::incrementAndGet).toCompletableFuture().get(5, TimeUnit.SECONDS);
+            assertThat(notifications.get()).isEqualTo(2);
+            assertThatThrownBy(engine::close).isInstanceOf(IllegalStateException.class);
+            assertThat(FailStopTask.stops.get()).isEqualTo(1);
         }
         finally {
-            RetryTask.release.countDown();
             threads.shutdownNow();
         }
     }
@@ -245,25 +229,24 @@ public class AsyncEmbeddedEngineShutdownTest {
     }
 
     @Test(timeout = 10000)
-    public void converterCloseExceptionDoesNotBlockTaskCleanupRetry() throws Exception {
+    public void converterCloseExceptionDoesNotPreventCleanupCompletion() throws Exception {
         converterCloseFailure(false);
     }
 
     @Test(timeout = 10000)
-    public void converterCloseErrorDoesNotBlockTaskCleanupRetry() throws Exception {
+    public void converterCloseErrorDoesNotPreventCleanupCompletion() throws Exception {
         converterCloseFailure(true);
     }
 
     private void converterCloseFailure(boolean failWithError) throws Exception {
         FailingCloseConverter.failWithError = failWithError;
-        RetryTask.stops.set(0);
-        RetryTask.polling = new CountDownLatch(1);
-        RetryTask.release = new CountDownLatch(0);
+        FailStopTask.stops.set(0);
+        FailStopTask.polling = new CountDownLatch(1);
         var success = new AtomicReference<Boolean>();
         var error = new AtomicReference<Throwable>();
         Properties props = new Properties();
         props.setProperty(ConnectorConfig.NAME_CONFIG, "converter-close-failure");
-        props.setProperty(ConnectorConfig.CONNECTOR_CLASS_CONFIG, RetryConnector.class.getName());
+        props.setProperty(ConnectorConfig.CONNECTOR_CLASS_CONFIG, FailStopConnector.class.getName());
         props.setProperty(StandaloneConfig.OFFSET_STORAGE_FILE_FILENAME_CONFIG,
                 temporaryFolder.newFolder().toPath().resolve("offsets").toString());
         props.setProperty(AsyncEngineConfig.TASK_MANAGEMENT_TIMEOUT_MS.name(), "200");
@@ -282,24 +265,18 @@ public class AsyncEmbeddedEngineShutdownTest {
         var threads = Executors.newSingleThreadExecutor();
         try {
             var run = threads.submit(engine);
-            assertThat(RetryTask.polling.await(5, TimeUnit.SECONDS)).isTrue();
+            assertThat(FailStopTask.polling.await(5, TimeUnit.SECONDS)).isTrue();
             engine.close();
             run.get(5, TimeUnit.SECONDS);
             assertThat(success.get()).isFalse();
-            assertThat(error.get()).isInstanceOf(failWithError ? AssertionError.class : IllegalStateException.class)
-                    .hasMessage("header converter close failed");
-            assertThat(error.get().getSuppressed()).extracting(Throwable::getMessage).contains("first stop failed");
+            assertThat(error.get()).hasMessage("task stop failed");
+            assertThat(error.get().getSuppressed())
+                    .anySatisfy(failure -> assertThat(failure).isInstanceOf(failWithError ? AssertionError.class : IllegalStateException.class)
+                            .hasMessage("header converter close failed"));
             assertThat(AsyncEmbeddedEngineTest.CloseTestTransform.wasClosed).isTrue();
-            assertThat(RetryTask.stops.get()).isEqualTo(1);
-            assertThat(engine.hasPendingCleanup()).isTrue();
-
-            // The task retry must run, while the non-task converter failure remains visible.
-            assertThatThrownBy(engine::retryFailedTaskStops).isInstanceOf(java.io.IOException.class).hasCause(error.get());
-            assertThat(RetryTask.stops.get()).isEqualTo(2);
-            assertThat(engine.getShutdownFailure()).isSameAs(error.get());
+            assertThat(FailStopTask.stops.get()).isEqualTo(1);
             assertThat(engine.hasPendingCleanup()).isFalse();
-            assertThatThrownBy(engine::retryFailedTaskStops).isInstanceOf(java.io.IOException.class).hasCause(error.get());
-            assertThat(RetryTask.stops.get()).isEqualTo(2);
+            assertThat(engine.getShutdownFailure()).isSameAs(error.get());
         }
         finally {
             threads.shutdownNow();
@@ -335,7 +312,7 @@ public class AsyncEmbeddedEngineShutdownTest {
     }
 
     @Test(timeout = 10000)
-    public void cleanupRetryUnblocksPollingThatIgnoresInterrupts() throws Exception {
+    public void failedCleanupRemainsPendingOnlyWhilePollingIsStillRunning() throws Exception {
         BlockedPollTask.polling = new CountDownLatch(1);
         BlockedPollTask.release = new CountDownLatch(1);
         BlockedPollTask.stops.set(0);
@@ -348,10 +325,15 @@ public class AsyncEmbeddedEngineShutdownTest {
             engine.close();
             assertThat(BlockedPollTask.stops.get()).isEqualTo(1);
             assertThat(BlockedPollTask.release.getCount()).isEqualTo(1);
-            engine.retryFailedTaskStops();
+            assertThat(engine.hasPendingCleanup()).isTrue();
+            assertThatThrownBy(() -> engine.cleanupCompletion().toCompletableFuture().get(100, TimeUnit.MILLISECONDS))
+                    .isInstanceOf(TimeoutException.class);
+            BlockedPollTask.release.countDown();
+            engine.cleanupCompletion().toCompletableFuture().get(5, TimeUnit.SECONDS);
             run.get(5, TimeUnit.SECONDS);
-            assertThat(BlockedPollTask.stops.get()).isEqualTo(2);
-            assertThat(engine.getShutdownFailure()).isNull();
+            assertThat(BlockedPollTask.stops.get()).isEqualTo(1);
+            assertThat(engine.getShutdownFailure()).hasMessage("first stop failed");
+            assertThat(engine.hasPendingCleanup()).isFalse();
         }
         finally {
             BlockedPollTask.release.countDown();
@@ -385,7 +367,7 @@ public class AsyncEmbeddedEngineShutdownTest {
     }
 
     @Test(timeout = 10000)
-    public void retryWaitsForInitialCleanupWithoutStoppingConcurrently() throws Exception {
+    public void timedOutCleanupFinishesWithoutAnotherStop() throws Exception {
         SlowStopTask.polling = new CountDownLatch(1);
         SlowStopTask.release = new CountDownLatch(1);
         SlowStopTask.stops.set(0);
@@ -397,10 +379,11 @@ public class AsyncEmbeddedEngineShutdownTest {
             assertThat(SlowStopTask.polling.await(5, TimeUnit.SECONDS)).isTrue();
             engine.close();
             run.get(5, TimeUnit.SECONDS);
-            assertThatThrownBy(engine::retryFailedTaskStops).isInstanceOf(TimeoutException.class);
+            assertThatThrownBy(() -> engine.cleanupCompletion().toCompletableFuture().get(100, TimeUnit.MILLISECONDS))
+                    .isInstanceOf(TimeoutException.class);
             assertThat(SlowStopTask.stops.get()).isEqualTo(1);
             SlowStopTask.release.countDown();
-            engine.retryFailedTaskStops();
+            engine.cleanupCompletion().toCompletableFuture().get(5, TimeUnit.SECONDS);
             assertThat(SlowStopTask.stops.get()).isEqualTo(1);
             assertThat(engine.getShutdownFailure()).isNull();
         }
@@ -535,8 +518,7 @@ public class AsyncEmbeddedEngineShutdownTest {
             assertThat(engine.getShutdownFailure()).isSameAs(error.get());
             assertThat(CommitErrorTask.stops.get()).isEqualTo(1);
             assertThat(engine.hasPendingCleanup()).isFalse();
-            assertThatThrownBy(engine::retryFailedTaskStops).isInstanceOf(java.io.IOException.class)
-                    .hasCause(error.get());
+            engine.cleanupCompletion().toCompletableFuture().get(5, TimeUnit.SECONDS);
             assertThat(engine.getShutdownFailure()).isSameAs(error.get());
             assertThat(CommitErrorTask.stops.get()).isEqualTo(1);
         }
@@ -652,13 +634,14 @@ public class AsyncEmbeddedEngineShutdownTest {
             assertThat(engine.getShutdownFailure()).isNotNull();
             assertThat(LateStartTask.stops.get()).isZero();
             assertThat(engine.hasPendingCleanup()).isTrue();
-            assertThatThrownBy(engine::retryFailedTaskStops).isInstanceOf(TimeoutException.class);
+            assertThatThrownBy(() -> engine.cleanupCompletion().toCompletableFuture().get(100, TimeUnit.MILLISECONDS))
+                    .isInstanceOf(TimeoutException.class);
             assertThat(LateStartTask.stops.get()).isZero();
             LateStartTask.release.countDown();
-            // Cleanup must happen automatically after start() returns, without another retry.
+            // The only cleanup attempt must run after start() returns.
             assertThat(LateStartTask.cleaned.await(5, TimeUnit.SECONDS)).isTrue();
             assertThat(LateStartTask.resourceOpen.get()).isFalse();
-            engine.retryFailedTaskStops();
+            engine.cleanupCompletion().toCompletableFuture().get(5, TimeUnit.SECONDS);
             assertThat(engine.getShutdownFailure()).isNull();
             assertThat(LateStartTask.stops.get()).isEqualTo(1);
             assertThat(engine.hasPendingCleanup()).isFalse();

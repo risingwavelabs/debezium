@@ -18,8 +18,9 @@ import java.util.Optional;
 import java.util.Properties;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
 import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorCompletionService;
 import java.util.concurrent.ExecutorService;
@@ -122,8 +123,8 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
     private final AtomicReference<Throwable> shutdownWaitError = new AtomicReference<>();
     private final List<TaskCleanup> taskCleanups = new CopyOnWriteArrayList<>();
     private final LifecycleGate initialization = new LifecycleGate();
-    // Tracks actual initial cleanup completion, independently of bounded caller/callback waits.
-    private final CountDownLatch shutDownLatch = new CountDownLatch(1);
+    // Completes after every cleanup attempt and worker has finished, including failed attempts.
+    private final CompletableFuture<Void> cleanupFinished = new CompletableFuture<>();
     private Signaler signaler;
 
     private AsyncEmbeddedEngine(Properties config,
@@ -268,8 +269,8 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
     @Override
     public void close() throws IOException {
         LOGGER.debug("Engine shutdown called.");
-        // Actual engine state may change until we pass all the checks, but in such case we fail in setEngineState() method.
-        final State engineState = getEngineState();
+        // Claim shutdown atomically even if initialization is advancing concurrently.
+        final State engineState = state.getAndUpdate(current -> State.canBeStopped(current) ? State.STOPPING : current);
 
         // Task startup is ordered against cleanup by each task's lifecycle gate.
         // Stopping the tasks should be idempotent, but who knows, better to avoid situation when stop is called multiple times.
@@ -284,8 +285,7 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
         }
 
         LOGGER.debug("Stopping " + AsyncEmbeddedEngine.class.getName());
-        // Engine state must not change during the checks above and has to be the same as the one stored in the `engineState`.
-        setEngineState(engineState, State.STOPPING);
+        LOGGER.info("Engine state has changed from '{}' to '{}'", engineState, State.STOPPING);
         startShutdown();
     }
 
@@ -304,7 +304,7 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
 
     /**
      * One daemon owns initial cleanup. Callers wait for a bounded time, while resource creation
-     * and native cleanup may finish later; the completion latch is released only by that owner.
+     * and native cleanup may finish later; only that owner completes the cleanup notification.
      */
     private void startShutdown() {
         ExecutorService shutdown = newTaskCleanupExecutor();
@@ -328,7 +328,7 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
                 }
             }
             finally {
-                shutDownLatch.countDown();
+                cleanupFinished.complete(null);
                 if (interrupted) {
                     Thread.currentThread().interrupt();
                 }
@@ -346,27 +346,33 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
         void run() throws Exception;
     }
 
-    private void runCleanup(String resource, CleanupAction action) {
+    private boolean runCleanup(String resource, CleanupAction action) {
         try {
             action.run();
+            return true;
         }
         catch (Exception | Error e) {
             shutdownError.updateAndGet(previous -> combineFailures(previous, e));
             LOGGER.warn("Failed to clean up {}", resource, e);
+            return false;
         }
     }
 
     private void awaitShutdown() {
         try {
-            if (!shutDownLatch.await(config.getLong(AsyncEngineConfig.TASK_MANAGEMENT_TIMEOUT_MS), TimeUnit.MILLISECONDS)) {
-                shutdownWaitError.compareAndSet(null, new TimeoutException("Engine cleanup has not finished"));
-            }
+            cleanupFinished.get(config.getLong(AsyncEngineConfig.TASK_MANAGEMENT_TIMEOUT_MS), TimeUnit.MILLISECONDS);
+        }
+        catch (TimeoutException e) {
+            shutdownWaitError.compareAndSet(null, new TimeoutException("Engine cleanup has not finished"));
         }
         catch (InterruptedException e) {
-            if (shutDownLatch.getCount() != 0) {
+            if (hasPendingCleanup()) {
                 shutdownWaitError.compareAndSet(null, e);
             }
             Thread.currentThread().interrupt();
+        }
+        catch (ExecutionException e) {
+            throw new IllegalStateException("Cleanup completion is only completed normally", e);
         }
     }
 
@@ -696,27 +702,27 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
     /** Runs task cleanup independently of polling and keeps shared resources alive until it ends. */
     private void stopSourceTasks() throws Exception {
         ExecutorService cleanups = newTaskCleanupExecutor();
-        List<Future<?>> attempts = new ArrayList<>();
+        List<Future<Boolean>> attempts = new ArrayList<>();
         boolean interrupted = false;
         try {
             for (TaskCleanup cleanup : taskCleanups) {
                 EngineSourceTask task = tasks.stream().filter(t -> t.connectTask() == cleanup.task).findFirst().orElse(null);
-                attempts.add(cleanup.submit(cleanups, () -> runCleanup("final offset commit", () -> {
-                    if (task == null) {
-                        return;
+                Runnable finalCommit = () -> runCleanup("final offset commit", () -> {
+                    if (task != null) {
+                        long timeout = Configuration.from(task.context().config()).getLong(EmbeddedEngineConfig.OFFSET_COMMIT_TIMEOUT_MS);
+                        commitOffsets(task.context().offsetStorageWriter(), task.context().clock(), timeout, task.connectTask(),
+                                failure -> shutdownError.updateAndGet(previous -> combineFailures(previous, failure)));
                     }
-                    long timeout = Configuration.from(task.context().config()).getLong(EmbeddedEngineConfig.OFFSET_COMMIT_TIMEOUT_MS);
-                    commitOffsets(task.context().offsetStorageWriter(), task.context().clock(), timeout, task.connectTask(),
-                            failure -> shutdownError.updateAndGet(previous -> combineFailures(previous, failure)));
-                })));
+                });
+                attempts.add(cleanups.submit(() -> runCleanup("source task", () -> cleanup.stop(finalCommit))));
             }
             long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(config.getLong(AsyncEngineConfig.TASK_MANAGEMENT_TIMEOUT_MS));
-            for (Future<?> attempt : attempts) {
+            for (Future<Boolean> attempt : attempts) {
                 try {
                     attempt.get(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
                 }
                 catch (ExecutionException e) {
-                    LOGGER.warn("Task cleanup failed; it remains available for retry", e);
+                    LOGGER.warn("Task cleanup failed", e);
                 }
                 catch (TimeoutException | InterruptedException e) {
                     shutdownWaitError.compareAndSet(null, e);
@@ -726,12 +732,15 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
                     break;
                 }
             }
-            // This daemon owns completion. Public close/retry waits are bounded separately.
-            for (Future<?> attempt : attempts) {
+            // This daemon owns completion. The public close wait is bounded separately.
+            int stoppedTasks = 0;
+            for (Future<Boolean> attempt : attempts) {
                 boolean done = false;
                 while (!done) {
                     try {
-                        attempt.get();
+                        if (attempt.get()) {
+                            stoppedTasks++;
+                        }
                         done = true;
                     }
                     catch (ExecutionException e) {
@@ -742,10 +751,8 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
                     }
                 }
             }
-            for (TaskCleanup cleanup : taskCleanups) {
-                if (cleanup.failure() == null) {
-                    runCleanup("task callback", () -> connectorCallback.ifPresent(DebeziumEngine.ConnectorCallback::taskStopped));
-                }
+            for (int i = 0; i < stoppedTasks; i++) {
+                runCleanup("task callback", () -> connectorCallback.ifPresent(DebeziumEngine.ConnectorCallback::taskStopped));
             }
         }
         finally {
@@ -767,73 +774,20 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
      */
     public Throwable getShutdownFailure() {
         Throwable failure = shutdownError.get();
-        for (TaskCleanup cleanup : taskCleanups) {
-            failure = combineFailures(failure, cleanup.failure());
-        }
         return hasPendingCleanup() ? combineFailures(failure, shutdownWaitError.get()) : failure;
     }
 
-    /**
-     * Whether the initial shutdown attempt or a task cleanup attempt is unfinished/retryable.
-     * Historical commit, converter, connector and offset-store errors do not imply pending work:
-     * task-stop retries cannot repair those failures, which remain in {@link #getShutdownFailure()}.
-     */
+    /** Whether initialization, workers, or the single cleanup attempt are still unfinished. */
     public boolean hasPendingCleanup() {
-        if (shutDownLatch.getCount() != 0) {
-            return true;
-        }
-        for (TaskCleanup cleanup : taskCleanups) {
-            if (cleanup.pending()) {
-                return true;
-            }
-        }
-        return false;
+        return !cleanupFinished.isDone();
     }
 
     /**
-     * Retry failed task stops without restarting the engine or using its terminated task executor.
-     * Successful tasks are not stopped again. An in-flight cleanup is awaited rather than duplicated.
-     * Connector/offset-store failures remain visible; this method cannot retry those resources.
+     * Completion of all cleanup attempts, regardless of success; failures remain available through
+     * {@link #getShutdownFailure()}. Observers registered after completion are also notified.
      */
-    public synchronized void retryFailedTaskStops() throws Exception {
-        if (!isShutdownRequested()) {
-            throw new IllegalStateException("Engine shutdown has not been requested");
-        }
-        final long timeout = config.getLong(AsyncEngineConfig.TASK_MANAGEMENT_TIMEOUT_MS);
-        final long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeout);
-        ExecutorService retries = newTaskCleanupExecutor();
-        try {
-            List<Future<?>> attempts = new ArrayList<>();
-            for (TaskCleanup cleanup : taskCleanups) {
-                Future<?> attempt = cleanup.retry(retries);
-                if (attempt != null) {
-                    attempts.add(attempt);
-                }
-            }
-            for (Future<?> attempt : attempts) {
-                try {
-                    attempt.get(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
-                }
-                catch (ExecutionException e) {
-                    LOGGER.warn("Failure during retrying task cleanup", e);
-                }
-            }
-            if (!shutDownLatch.await(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS)) {
-                throw new TimeoutException("Initial engine cleanup is still running");
-            }
-            shutdownWaitError.set(null);
-            Throwable failure = getShutdownFailure();
-            if (failure != null) {
-                throw new IOException("Engine cleanup failed", failure);
-            }
-        }
-        catch (TimeoutException | InterruptedException e) {
-            shutdownWaitError.set(e);
-            throw e;
-        }
-        finally {
-            retries.shutdownNow();
-        }
+    public CompletionStage<Void> cleanupCompletion() {
+        return cleanupFinished.minimalCompletionStage();
     }
 
     private static ExecutorService newTaskCleanupExecutor() {
