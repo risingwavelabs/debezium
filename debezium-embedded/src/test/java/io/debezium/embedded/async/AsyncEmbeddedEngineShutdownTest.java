@@ -289,11 +289,13 @@ public class AsyncEmbeddedEngineShutdownTest {
             assertThat(error.get().getSuppressed()).extracting(Throwable::getMessage).contains("first stop failed");
             assertThat(AsyncEmbeddedEngineTest.CloseTestTransform.wasClosed).isTrue();
             assertThat(RetryTask.stops.get()).isEqualTo(1);
+            assertThat(engine.hasPendingCleanup()).isTrue();
 
             // The task retry must run, while the non-task converter failure remains visible.
             assertThatThrownBy(engine::retryFailedTaskStops).isInstanceOf(java.io.IOException.class).hasCause(error.get());
             assertThat(RetryTask.stops.get()).isEqualTo(2);
             assertThat(engine.getShutdownFailure()).isSameAs(error.get());
+            assertThat(engine.hasPendingCleanup()).isFalse();
             assertThatThrownBy(engine::retryFailedTaskStops).isInstanceOf(java.io.IOException.class).hasCause(error.get());
             assertThat(RetryTask.stops.get()).isEqualTo(2);
         }
@@ -530,6 +532,7 @@ public class AsyncEmbeddedEngineShutdownTest {
             assertThat(error.get()).isInstanceOf(failureType).hasMessage(message);
             assertThat(engine.getShutdownFailure()).isSameAs(error.get());
             assertThat(CommitErrorTask.stops.get()).isEqualTo(1);
+            assertThat(engine.hasPendingCleanup()).isFalse();
             assertThatThrownBy(engine::retryFailedTaskStops).isInstanceOf(java.io.IOException.class)
                     .hasCause(error.get());
             assertThat(engine.getShutdownFailure()).isSameAs(error.get());
@@ -646,6 +649,7 @@ public class AsyncEmbeddedEngineShutdownTest {
             assertThat(success.get()).isFalse();
             assertThat(engine.getShutdownFailure()).isNotNull();
             assertThat(LateStartTask.stops.get()).isZero();
+            assertThat(engine.hasPendingCleanup()).isTrue();
             assertThatThrownBy(engine::retryFailedTaskStops).isInstanceOf(TimeoutException.class);
             assertThat(LateStartTask.stops.get()).isZero();
             LateStartTask.release.countDown();
@@ -655,6 +659,7 @@ public class AsyncEmbeddedEngineShutdownTest {
             engine.retryFailedTaskStops();
             assertThat(engine.getShutdownFailure()).isNull();
             assertThat(LateStartTask.stops.get()).isEqualTo(1);
+            assertThat(engine.hasPendingCleanup()).isFalse();
         }
         finally {
             LateStartTask.release.countDown();

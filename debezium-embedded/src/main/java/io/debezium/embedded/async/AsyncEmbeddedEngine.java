@@ -748,6 +748,24 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
     }
 
     /**
+     * Whether shutdown is still running or task cleanup remains unfinished/retryable.
+     * Historical commit, converter, connector and offset-store errors do not imply pending work:
+     * task-stop retries cannot repair those failures, which remain in {@link #getShutdownFailure()}.
+     */
+    public boolean hasPendingCleanup() {
+        if (shutDownLatch.getCount() != 0) {
+            return true;
+        }
+        for (TaskCleanup cleanup : taskCleanups) {
+            Future<?> attempt = cleanup.attempt;
+            if (!cleanup.stopped || (attempt != null && !attempt.isDone())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
      * Retry failed task stops without restarting the engine or using its terminated task executor.
      * Successful tasks are not stopped again. An in-flight cleanup is awaited rather than duplicated.
      * Connector/offset-store failures remain visible; this method cannot retry those resources.
@@ -817,7 +835,7 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
         private volatile Throwable failure;
         // Tracks actual cleanup completion, including the first attempt. A cancelled polling
         // future or a terminated engine does not prove that task.stop() has finished.
-        private Future<?> attempt;
+        private volatile Future<?> attempt;
 
         private TaskCleanup(SourceTask task) {
             this.task = task;
