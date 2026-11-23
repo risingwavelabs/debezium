@@ -639,19 +639,22 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
      * @param tasks {@link List<EngineSourceTask>} of source tasks which should be stopped.
      */
     private void stopSourceTasks(final List<EngineSourceTask> tasks) {
+        // A polling thread may ignore interruption until stop() releases its resource.
+        // Cleanup must not queue behind that thread in the polling executor.
+        ExecutorService cleanups = newTaskCleanupExecutor();
         try {
             LOGGER.debug("Stopping source connector tasks.");
-            final ExecutorCompletionService<Void> taskCompletionService = new ExecutorCompletionService(taskService);
+            final ExecutorCompletionService<Void> taskCompletionService = new ExecutorCompletionService(cleanups);
             for (EngineSourceTask task : tasks) {
                 final TaskCleanup cleanup = new TaskCleanup(task.connectTask());
                 taskCleanups.add(cleanup);
                 final long commitTimeout = Configuration.from(task.context().config()).getLong(EmbeddedEngineConfig.OFFSET_COMMIT_TIMEOUT_MS);
-                taskCompletionService.submit(() -> {
+                cleanup.attempt = taskCompletionService.submit(() -> {
                     LOGGER.debug("Committing task's offset.");
                     try {
                         commitOffsets(task.context().offsetStorageWriter(), task.context().clock(), commitTimeout, task.connectTask());
                     }
-                    catch (Exception e) {
+                    catch (Exception | Error e) {
                         shutdownError.compareAndSet(null, e);
                         throw e;
                     }
@@ -670,7 +673,15 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
             for (int i = 0; i < nTasks; i++) {
                 final Future<Void> taskFuture = taskCompletionService.poll(taskStopTimeout, TimeUnit.MILLISECONDS);
                 if (taskFuture != null) {
-                    taskFuture.get(0, TimeUnit.MILLISECONDS); // we need to retrieve the results to propagate eventual exceptions
+                    try {
+                        taskFuture.get(0, TimeUnit.MILLISECONDS);
+                    }
+                    catch (ExecutionException e) {
+                        // The commit/cleanup records retain this failure. Let the other tasks
+                        // finish rather than interrupting their final commits after one failure.
+                        LOGGER.warn("Failure during stopping a task", e);
+                        continue;
+                    }
                 }
                 else {
                     throw new InterruptedException("Time out while waiting for source task to stop.");
@@ -691,13 +702,11 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
             LOGGER.warn("Stopping of the tasks was interrupted, shutting down immediately.");
         }
         catch (Exception e) {
-            // Task failures remain on their cleanup records, including failures after this wait.
-            if (!(e instanceof ExecutionException)) {
-                shutdownError.compareAndSet(null, e);
-            }
+            shutdownError.compareAndSet(null, e);
             LOGGER.warn("Failure during stopping tasks, stopping them immediately. Failed with ", e);
         }
         finally {
+            cleanups.shutdownNow();
             // Make sure task service is shut down and no other tasks can be run.
             taskService.shutdownNow();
         }
@@ -730,27 +739,29 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
             throw new IllegalStateException("Engine shutdown has not been requested");
         }
         final long timeout = config.getLong(AsyncEngineConfig.TASK_MANAGEMENT_TIMEOUT_MS);
-        if (!shutDownLatch.await(timeout, TimeUnit.MILLISECONDS)
-                || (!taskCleanups.isEmpty() && !taskService.awaitTermination(timeout, TimeUnit.MILLISECONDS))) {
+        if (!shutDownLatch.await(timeout, TimeUnit.MILLISECONDS)) {
             TimeoutException failure = new TimeoutException("Previous engine cleanup is still running");
             shutdownWaitError.set(failure);
             throw failure;
         }
-        ExecutorService retries = Executors.newCachedThreadPool(command -> {
-            Thread thread = new Thread(command, "debezium-task-cleanup-retry");
-            thread.setDaemon(true);
-            return thread;
-        });
+        ExecutorService retries = newTaskCleanupExecutor();
         try {
             for (TaskCleanup cleanup : taskCleanups) {
-                if (!cleanup.stopped && (cleanup.retry == null || cleanup.retry.isDone())) {
-                    cleanup.retry = retries.submit(cleanup::stop);
+                if (!cleanup.stopped && (cleanup.attempt == null || cleanup.attempt.isDone())) {
+                    cleanup.attempt = retries.submit(cleanup::stop);
                 }
             }
             final long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeout);
             for (TaskCleanup cleanup : taskCleanups) {
-                if (cleanup.retry != null) {
-                    cleanup.retry.get(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
+                if (cleanup.attempt != null) {
+                    try {
+                        cleanup.attempt.get(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
+                    }
+                    catch (ExecutionException e) {
+                        // Failures are retained on the cleanup record. Await the remaining
+                        // attempts before shutting down their executor.
+                        LOGGER.warn("Failure during retrying task cleanup", e);
+                    }
                 }
             }
             shutdownWaitError.set(null);
@@ -768,11 +779,21 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
         }
     }
 
+    private static ExecutorService newTaskCleanupExecutor() {
+        return Executors.newCachedThreadPool(command -> {
+            Thread thread = new Thread(command, "debezium-task-cleanup");
+            thread.setDaemon(true);
+            return thread;
+        });
+    }
+
     private static final class TaskCleanup {
         private final SourceTask task;
         private volatile boolean stopped;
         private volatile Throwable failure;
-        private Future<?> retry;
+        // Tracks actual cleanup completion, including the first attempt. A cancelled polling
+        // future or a terminated engine does not prove that task.stop() has finished.
+        private Future<?> attempt;
 
         private TaskCleanup(SourceTask task) {
             this.task = task;
