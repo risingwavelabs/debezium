@@ -18,6 +18,7 @@ import java.util.Optional;
 import java.util.Properties;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CancellationException;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorCompletionService;
@@ -117,6 +118,8 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
     private final ExecutorService taskService;
     private final ExecutorService recordService;
     private final AtomicReference<Throwable> shutdownError = new AtomicReference<>();
+    private final AtomicReference<Throwable> shutdownWaitError = new AtomicReference<>();
+    private final List<TaskCleanup> taskCleanups = new CopyOnWriteArrayList<>();
     // A latch to make sure close() method finishes before we call completion callback, see also DBZ-7496.
     private final CountDownLatch shutDownLatch = new CountDownLatch(1);
     private Signaler signaler;
@@ -303,6 +306,7 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
                 headerConverter.close();
             }
             catch (IOException e) {
+                shutdownError.compareAndSet(null, e);
                 LOGGER.warn("Failed to close header converter: ", e);
             }
         }
@@ -311,6 +315,7 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
                 transformations.close();
             }
             catch (IOException e) {
+                shutdownError.compareAndSet(null, e);
                 LOGGER.warn("Failed to close transformations: ", e);
             }
         }
@@ -346,21 +351,23 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
      */
     private void finishShutDown(Throwable exitError) {
         try {
-            shutDownLatch.await(config.getLong(AsyncEngineConfig.TASK_MANAGEMENT_TIMEOUT_MS), TimeUnit.MILLISECONDS);
+            if (!shutDownLatch.await(config.getLong(AsyncEngineConfig.TASK_MANAGEMENT_TIMEOUT_MS), TimeUnit.MILLISECONDS)) {
+                shutdownWaitError.compareAndSet(null, new TimeoutException("Engine cleanup has not finished"));
+            }
         }
         catch (InterruptedException e) {
+            // An interrupted wait is not evidence that resources have been released.
+            if (shutDownLatch.getCount() != 0) {
+                shutdownWaitError.compareAndSet(null, e);
+            }
+            Thread.currentThread().interrupt();
             LOGGER.warn("Interrupted while waiting for shutdown to finish.");
         }
         LOGGER.info("Engine is stopped.");
         setEngineState(State.STOPPING, State.STOPPED);
         LOGGER.debug("Calling completion handler.");
-        Throwable cleanupError = shutdownError.get();
-        if (exitError == null) {
-            exitError = cleanupError;
-        }
-        else if (cleanupError != null && cleanupError != exitError) {
-            exitError.addSuppressed(cleanupError);
-        }
+        // Attach cleanup errors to the exception delivered to the callback, not its Future wrapper.
+        exitError = combineFailures(unwrapExecutionException(exitError), getShutdownFailure());
         callCompletionHandler(exitError);
     }
 
@@ -636,15 +643,21 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
             LOGGER.debug("Stopping source connector tasks.");
             final ExecutorCompletionService<Void> taskCompletionService = new ExecutorCompletionService(taskService);
             for (EngineSourceTask task : tasks) {
+                final TaskCleanup cleanup = new TaskCleanup(task.connectTask());
+                taskCleanups.add(cleanup);
                 final long commitTimeout = Configuration.from(task.context().config()).getLong(EmbeddedEngineConfig.OFFSET_COMMIT_TIMEOUT_MS);
                 taskCompletionService.submit(() -> {
                     LOGGER.debug("Committing task's offset.");
                     try {
                         commitOffsets(task.context().offsetStorageWriter(), task.context().clock(), commitTimeout, task.connectTask());
                     }
+                    catch (Exception e) {
+                        shutdownError.compareAndSet(null, e);
+                        throw e;
+                    }
                     finally {
                         LOGGER.debug("Stopping Connect task.");
-                        task.connectTask().stop();
+                        cleanup.stop();
                     }
                     return null;
                 });
@@ -674,17 +687,130 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
             taskService.shutdown();
         }
         catch (InterruptedException e) {
-            shutdownError.compareAndSet(null, e);
+            shutdownWaitError.compareAndSet(null, e);
             LOGGER.warn("Stopping of the tasks was interrupted, shutting down immediately.");
         }
         catch (Exception e) {
-            shutdownError.compareAndSet(null, e);
+            // Task failures remain on their cleanup records, including failures after this wait.
+            if (!(e instanceof ExecutionException)) {
+                shutdownError.compareAndSet(null, e);
+            }
             LOGGER.warn("Failure during stopping tasks, stopping them immediately. Failed with ", e);
         }
         finally {
             // Make sure task service is shut down and no other tasks can be run.
             taskService.shutdownNow();
         }
+    }
+
+    /** Whether normal shutdown has already been requested, including after completion. */
+    public boolean isShutdownRequested() {
+        return !State.canBeStopped(getEngineState());
+    }
+
+    /**
+     * Current cleanup failure, independent of a polling failure delivered to the completion callback.
+     * A timed-out wait remains a failure until cleanup is explicitly checked by a retry.
+     */
+    public Throwable getShutdownFailure() {
+        Throwable failure = shutdownError.get();
+        for (TaskCleanup cleanup : taskCleanups) {
+            failure = combineFailures(failure, cleanup.failure);
+        }
+        return combineFailures(failure, shutdownWaitError.get());
+    }
+
+    /**
+     * Retry failed task stops without restarting the engine or using its terminated task executor.
+     * Successful tasks are not stopped again. An in-flight cleanup is awaited rather than duplicated.
+     * Connector/offset-store failures remain visible; this method cannot retry those resources.
+     */
+    public synchronized void retryFailedTaskStops() throws Exception {
+        if (!isShutdownRequested()) {
+            throw new IllegalStateException("Engine shutdown has not been requested");
+        }
+        final long timeout = config.getLong(AsyncEngineConfig.TASK_MANAGEMENT_TIMEOUT_MS);
+        if (!shutDownLatch.await(timeout, TimeUnit.MILLISECONDS)
+                || (!taskCleanups.isEmpty() && !taskService.awaitTermination(timeout, TimeUnit.MILLISECONDS))) {
+            TimeoutException failure = new TimeoutException("Previous engine cleanup is still running");
+            shutdownWaitError.set(failure);
+            throw failure;
+        }
+        ExecutorService retries = Executors.newCachedThreadPool(command -> {
+            Thread thread = new Thread(command, "debezium-task-cleanup-retry");
+            thread.setDaemon(true);
+            return thread;
+        });
+        try {
+            for (TaskCleanup cleanup : taskCleanups) {
+                if (!cleanup.stopped && (cleanup.retry == null || cleanup.retry.isDone())) {
+                    cleanup.retry = retries.submit(cleanup::stop);
+                }
+            }
+            final long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeout);
+            for (TaskCleanup cleanup : taskCleanups) {
+                if (cleanup.retry != null) {
+                    cleanup.retry.get(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
+                }
+            }
+            shutdownWaitError.set(null);
+            Throwable failure = getShutdownFailure();
+            if (failure != null) {
+                throw new IOException("Engine cleanup failed", failure);
+            }
+        }
+        catch (TimeoutException | InterruptedException e) {
+            shutdownWaitError.set(e);
+            throw e;
+        }
+        finally {
+            retries.shutdownNow();
+        }
+    }
+
+    private static final class TaskCleanup {
+        private final SourceTask task;
+        private volatile boolean stopped;
+        private volatile Throwable failure;
+        private Future<?> retry;
+
+        private TaskCleanup(SourceTask task) {
+            this.task = task;
+        }
+
+        private void stop() {
+            try {
+                task.stop();
+                failure = null;
+                stopped = true;
+            }
+            catch (RuntimeException | Error e) {
+                failure = e;
+                throw e;
+            }
+        }
+    }
+
+    private static Throwable unwrapExecutionException(Throwable failure) {
+        return failure instanceof ExecutionException && failure.getCause() != null ? failure.getCause() : failure;
+    }
+
+    private static Throwable combineFailures(Throwable primary, Throwable secondary) {
+        secondary = unwrapExecutionException(secondary);
+        if (primary == null) {
+            return secondary;
+        }
+        if (secondary != null && primary != secondary) {
+            synchronized (primary) {
+                for (Throwable suppressed : primary.getSuppressed()) {
+                    if (suppressed == secondary) {
+                        return primary;
+                    }
+                }
+                primary.addSuppressed(secondary);
+            }
+        }
+        return primary;
     }
 
     /**
@@ -704,6 +830,7 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
             connectorContext.offsetStore().stop();
         }
         catch (Exception e) {
+            shutdownError.compareAndSet(null, e);
             LOGGER.warn("Failed to stop offset backing store", e);
         }
     }
