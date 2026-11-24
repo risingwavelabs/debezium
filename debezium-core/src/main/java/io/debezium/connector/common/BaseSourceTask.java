@@ -460,9 +460,28 @@ public abstract class BaseSourceTask<P extends Partition, O extends OffsetContex
 
     @Override
     public final void stop() {
-        performCommit();
-        stop(false);
-        DebeziumOpenLineageEmitter.cleanup(DebeziumOpenLineageEmitter.connectorContext(config.asMap(), connectorName()));
+        Throwable commitFailure = null;
+        try {
+            performCommit();
+        }
+        catch (RuntimeException | Error e) {
+            commitFailure = e;
+            throw e;
+        }
+        finally {
+            try {
+                stop(false);
+                if (config != null) {
+                    DebeziumOpenLineageEmitter.cleanup(DebeziumOpenLineageEmitter.connectorContext(config.asMap(), connectorName()));
+                }
+            }
+            catch (RuntimeException | Error e) {
+                if (commitFailure == null) {
+                    throw e;
+                }
+                commitFailure.addSuppressed(e);
+            }
+        }
     }
 
     private void stop(boolean restart) {
@@ -476,6 +495,8 @@ public abstract class BaseSourceTask<P extends Partition, O extends OffsetContex
                 LOGGER.info("Stopping down connector");
             }
 
+            Throwable stopFailure = null;
+            boolean interrupted = false;
             try {
                 if (coordinator != null) {
                     coordinator.stop();
@@ -483,12 +504,33 @@ public abstract class BaseSourceTask<P extends Partition, O extends OffsetContex
                 }
             }
             catch (InterruptedException e) {
+                interrupted = true;
                 Thread.interrupted();
                 LOGGER.error("Interrupted while stopping coordinator", e);
-                throw new ConnectException("Interrupted while stopping coordinator, failing the task");
+                ConnectException failure = new ConnectException("Interrupted while stopping coordinator, failing the task", e);
+                stopFailure = failure;
+                throw failure;
             }
-
-            doStop();
+            catch (RuntimeException | Error e) {
+                stopFailure = e;
+                throw e;
+            }
+            finally {
+                try {
+                    doStop();
+                }
+                catch (RuntimeException | Error e) {
+                    if (stopFailure == null) {
+                        throw e;
+                    }
+                    stopFailure.addSuppressed(e);
+                }
+                finally {
+                    if (interrupted) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
+            }
 
             if (restart) {
                 setTaskState(DebeziumTaskState.RESTARTING);
@@ -498,7 +540,9 @@ public abstract class BaseSourceTask<P extends Partition, O extends OffsetContex
             }
             else {
                 setTaskState(DebeziumTaskState.STOPPED);
-                DebeziumOpenLineageEmitter.emit(DebeziumOpenLineageEmitter.connectorContext(config.asMap(), connectorName()), DebeziumTaskState.STOPPED);
+                if (config != null) {
+                    DebeziumOpenLineageEmitter.emit(DebeziumOpenLineageEmitter.connectorContext(config.asMap(), connectorName()), DebeziumTaskState.STOPPED);
+                }
             }
         }
         finally {

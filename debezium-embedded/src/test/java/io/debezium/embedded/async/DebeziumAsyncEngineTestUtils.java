@@ -9,6 +9,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.kafka.connect.connector.Task;
@@ -33,6 +34,29 @@ public class DebeziumAsyncEngineTestUtils {
         @Override
         public List<SourceRecord> poll() throws InterruptedException {
             throw new InterruptedException();
+        }
+    }
+
+    public static class FailingStopConnector extends SimpleSourceConnector {
+        @Override
+        public Class<? extends Task> taskClass() {
+            return FailingStopTask.class;
+        }
+    }
+
+    public static class FailingStopTask extends NoOpTask {
+        static CountDownLatch polling;
+
+        @Override
+        public List<SourceRecord> poll() throws InterruptedException {
+            polling.countDown();
+            return super.poll();
+        }
+
+        @Override
+        public void stop() {
+            super.stop();
+            throw new IllegalStateException("task cleanup failed");
         }
     }
 

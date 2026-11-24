@@ -134,16 +134,8 @@ public class Transformations implements Closeable {
 
     @Override
     public void close() throws IOException {
-
-        for (Transformation<SourceRecord> t : transforms) {
-            try {
-                t.close();
-            }
-            catch (Exception e) {
-                LOGGER.warn("Error while closing transformation", e);
-            }
-        }
-
-        this.predicates.close();
+        List<AutoCloseable> resources = new ArrayList<>(transforms);
+        resources.add(predicates);
+        Closeables.closeAll(resources);
     }
 }

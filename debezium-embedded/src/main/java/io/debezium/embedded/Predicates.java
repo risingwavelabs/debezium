@@ -75,13 +75,6 @@ public class Predicates implements Closeable {
 
     @Override
     public void close() throws IOException {
-        for (Predicate<SourceRecord> p : predicates.values()) {
-            try {
-                p.close();
-            }
-            catch (Exception e) {
-                LOGGER.warn("Error while closing predicate", e);
-            }
-        }
+        Closeables.closeAll(predicates.values());
     }
 }

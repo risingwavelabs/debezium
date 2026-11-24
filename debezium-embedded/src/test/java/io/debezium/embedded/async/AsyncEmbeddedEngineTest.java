@@ -324,6 +324,35 @@ public class AsyncEmbeddedEngineTest {
     }
 
     @Test
+    public void testTaskStopFailureReportedByCompletionCallback() throws Exception {
+        final Properties props = new Properties();
+        props.setProperty(ConnectorConfig.NAME_CONFIG, "failing-stop");
+        props.setProperty(ConnectorConfig.TASKS_MAX_CONFIG, "1");
+        props.setProperty(ConnectorConfig.CONNECTOR_CLASS_CONFIG, DebeziumAsyncEngineTestUtils.FailingStopConnector.class.getName());
+        props.setProperty(StandaloneConfig.OFFSET_STORAGE_FILE_FILENAME_CONFIG, OFFSET_STORE_PATH.toAbsolutePath().toString());
+        DebeziumAsyncEngineTestUtils.FailingStopTask.polling = new CountDownLatch(1);
+        CountDownLatch completed = new CountDownLatch(1);
+        java.util.concurrent.atomic.AtomicReference<Throwable> failure = new java.util.concurrent.atomic.AtomicReference<>();
+        DebeziumEngine.Builder<SourceRecord> builder = new AsyncEmbeddedEngine.AsyncEngineBuilder<>();
+        engine = builder.using(props)
+                .using(new TestEngineConnectorCallback())
+                .using((success, message, error) -> {
+                    if (!success) {
+                        failure.set(error);
+                    }
+                    completed.countDown();
+                })
+                .notifying((records, committer) -> {
+                })
+                .build();
+        engineExecSrv.submit(engine);
+        assertThat(DebeziumAsyncEngineTestUtils.FailingStopTask.polling.await(10, TimeUnit.SECONDS)).isTrue();
+        stopEngine();
+        assertThat(completed.await(10, TimeUnit.SECONDS)).isTrue();
+        assertThat(failure.get()).isInstanceOf(IllegalStateException.class).hasMessage("task cleanup failed");
+    }
+
+    @Test
     public void testCompletionCallbackCalledUponFailure() throws Exception {
         final Properties props = new Properties();
         props.put(EmbeddedEngineConfig.ENGINE_NAME.name(), "testing-connector");
@@ -420,14 +449,14 @@ public class AsyncEmbeddedEngineTest {
 
     @Test
     @FixFor("DBZ-2534")
-    public void testCannotStopWhileTasksAreStarting() throws Exception {
+    public void testCanStopWhileTasksAreStarting() throws Exception {
         final Properties props = new Properties();
         props.put(EmbeddedEngineConfig.ENGINE_NAME.name(), "testing-connector");
         props.setProperty(ConnectorConfig.TASKS_MAX_CONFIG, "1");
         props.put(EmbeddedEngineConfig.CONNECTOR_CLASS.name(), AsyncEmbeddedEngineTest.WaitInTaskStartConnector.class.getName());
         props.put(StandaloneConfig.OFFSET_STORAGE_FILE_FILENAME_CONFIG, OFFSET_STORE_PATH.toAbsolutePath().toString());
         props.put(SimpleSourceConnector.BATCH_COUNT, 1);
-        props.put(AsyncEngineConfig.TASK_MANAGEMENT_TIMEOUT_MS, "10");
+        props.put(AsyncEngineConfig.TASK_MANAGEMENT_TIMEOUT_MS.name(), "100");
 
         CountDownLatch taskStartingLatch = new CountDownLatch(1);
         CountDownLatch enginStopLatch = new CountDownLatch(1);
@@ -446,21 +475,14 @@ public class AsyncEmbeddedEngineTest {
 
         WaitInTaskStartTask.taskStartingLatch.await(AbstractConnectorTest.waitTimeForEngine(), TimeUnit.SECONDS);
 
-        Exception error = null;
         try {
-            stopEngine();
+            engine.close();
         }
-        catch (Exception e) {
-            error = e;
+        finally {
+            WaitInTaskStartTask.continueLatch.countDown();
         }
-        assertThat(error).isNotNull();
-        assertThat(error).isInstanceOf(IllegalStateException.class);
-        assertThat(error.getMessage())
-                .isEqualTo("Cannot stop engine while tasks are starting, this may lead to leaked resource. Wait for the tasks to be fully started.");
-
-        WaitInTaskStartTask.continueLatch.countDown();
-        waitForTasksToStart(1);
-        stopEngine();
+        waitForEngineToStop();
+        Awaitility.await().atMost(5, TimeUnit.SECONDS).until(() -> !((AsyncEmbeddedEngine<?>) engine).hasPendingCleanup());
     }
 
     @Test
