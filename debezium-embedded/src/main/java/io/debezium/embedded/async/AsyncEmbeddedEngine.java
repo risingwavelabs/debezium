@@ -121,7 +121,7 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
     private final ExecutorService recordService;
     private final AtomicReference<Throwable> shutdownError = new AtomicReference<>();
     private final AtomicReference<Throwable> shutdownWaitError = new AtomicReference<>();
-    private final List<TaskCleanup> taskCleanups = new CopyOnWriteArrayList<>();
+    private final List<TaskLifecycle> taskLifecycles = new CopyOnWriteArrayList<>();
     private final LifecycleGate initialization = new LifecycleGate();
     // Completes after every cleanup attempt and worker has finished, including failed attempts.
     private final CompletableFuture<Void> cleanupFinished = new CompletableFuture<>();
@@ -462,7 +462,7 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
         }
         for (Map<String, String> taskConfig : taskConfigs) {
             final SourceTask task = (SourceTask) taskClass.getDeclaredConstructor().newInstance();
-            taskCleanups.add(new TaskCleanup(task));
+            taskLifecycles.add(new TaskLifecycle(task));
             final EngineSourceTaskContext taskContext = new EngineSourceTaskContext(
                     taskConfig,
                     connector.context().offsetStorageReader(),
@@ -488,7 +488,7 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
         final ExecutorCompletionService<Void> taskCompletionService = new ExecutorCompletionService(taskService);
         for (EngineSourceTask task : tasks) {
             taskCompletionService.submit(() -> {
-                taskCleanup(task).start(task.context().config());
+                taskLifecycle(task).start(task.context().config());
                 return null;
             });
         }
@@ -708,8 +708,8 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
         List<Future<Boolean>> attempts = new ArrayList<>();
         boolean interrupted = false;
         try {
-            for (TaskCleanup cleanup : taskCleanups) {
-                EngineSourceTask task = tasks.stream().filter(t -> t.connectTask() == cleanup.task).findFirst().orElse(null);
+            for (TaskLifecycle lifecycle : taskLifecycles) {
+                EngineSourceTask task = tasks.stream().filter(t -> t.connectTask() == lifecycle.task).findFirst().orElse(null);
                 Runnable finalCommit = () -> runCleanup("final offset commit", () -> {
                     if (task != null) {
                         long timeout = Configuration.from(task.context().config()).getLong(EmbeddedEngineConfig.OFFSET_COMMIT_TIMEOUT_MS);
@@ -717,7 +717,7 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
                                 failure -> shutdownError.updateAndGet(previous -> combineFailures(previous, failure)));
                     }
                 });
-                attempts.add(cleanups.submit(() -> runCleanup("source task", () -> cleanup.stop(finalCommit))));
+                attempts.add(cleanups.submit(() -> runCleanup("source task", () -> lifecycle.stop(finalCommit))));
             }
             long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(config.getLong(AsyncEngineConfig.TASK_MANAGEMENT_TIMEOUT_MS));
             for (Future<Boolean> attempt : attempts) {
@@ -808,8 +808,8 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
         });
     }
 
-    private TaskCleanup taskCleanup(EngineSourceTask task) {
-        return taskCleanups.stream().filter(cleanup -> cleanup.task == task.connectTask()).findFirst().orElseThrow();
+    private TaskLifecycle taskLifecycle(EngineSourceTask task) {
+        return taskLifecycles.stream().filter(lifecycle -> lifecycle.task == task.connectTask()).findFirst().orElseThrow();
     }
 
     private static Throwable unwrapExecutionException(Throwable failure) {
@@ -1402,9 +1402,10 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
      * The default implementation of {@link DebeziumEngine.RecordCommitter}.
      * The implementation is not thread safe and the caller has to ensure it's used in thread safe manner.
      */
-    private static class SourceRecordCommitter implements DebeziumEngine.RecordCommitter<SourceRecord> {
+    private class SourceRecordCommitter implements DebeziumEngine.RecordCommitter<SourceRecord> {
 
         final SourceTask task;
+        final TaskLifecycle lifecycle;
         final OffsetStorageWriter offsetWriter;
         final OffsetCommitPolicy offsetCommitPolicy;
         final io.debezium.util.Clock clock;
@@ -1415,6 +1416,7 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
 
         SourceRecordCommitter(final EngineSourceTask task) {
             this.task = task.connectTask();
+            this.lifecycle = taskLifecycle(task);
             this.offsetWriter = task.context().offsetStorageWriter();
             this.offsetCommitPolicy = task.context().offsetCommitPolicy();
             this.clock = task.context().clock();
@@ -1423,25 +1425,30 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
 
         @Override
         public void markProcessed(SourceRecord record) throws InterruptedException {
-            task.commitRecord(record, null);
-            recordsSinceLastCommit += 1;
-            offsetWriter.offset(record.sourcePartition(), record.sourceOffset());
+            lifecycle.acknowledge(record, () -> {
+                recordsSinceLastCommit += 1;
+                offsetWriter.offset(record.sourcePartition(), record.sourceOffset());
+            });
         }
 
         @Override
         public void markBatchFinished() throws InterruptedException {
-            final Duration durationSinceLastCommit = Duration.ofMillis(clock.currentTimeInMillis() - timeOfLastCommitMillis);
-            if (offsetCommitPolicy.performCommit(recordsSinceLastCommit, durationSinceLastCommit)) {
-                try {
-                    if (commitOffsets(offsetWriter, clock, commitTimeout, task)) {
-                        recordsSinceLastCommit = 0;
-                        timeOfLastCommitMillis = clock.currentTimeInMillis();
+            // After the lifecycle boundary closes, shutdown flushes acknowledged offsets
+            // after worker termination without invoking the stopped task.
+            lifecycle.commitBatch(() -> {
+                final Duration durationSinceLastCommit = Duration.ofMillis(clock.currentTimeInMillis() - timeOfLastCommitMillis);
+                if (offsetCommitPolicy.performCommit(recordsSinceLastCommit, durationSinceLastCommit)) {
+                    try {
+                        if (commitOffsets(offsetWriter, clock, commitTimeout, task)) {
+                            recordsSinceLastCommit = 0;
+                            timeOfLastCommitMillis = clock.currentTimeInMillis();
+                        }
+                    }
+                    catch (TimeoutException e) {
+                        throw new DebeziumException("Timed out while waiting for committing task offset", e);
                     }
                 }
-                catch (TimeoutException e) {
-                    throw new DebeziumException("Timed out while waiting for committing task offset", e);
-                }
-            }
+            });
         }
 
         @Override
