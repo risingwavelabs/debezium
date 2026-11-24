@@ -317,9 +317,6 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
                 runCleanup("source tasks", this::stopSourceTasks);
                 interrupted |= awaitExecutor(taskService);
                 interrupted |= awaitExecutor(recordService);
-                // Consumers may acknowledge records after the pre-stop commit. Persist those
-                // offsets once no worker can add more, without invoking a stopped task again.
-                runCleanup("remaining offsets", this::flushRemainingOffsets);
                 runCleanup("offset store", () -> stopOffsetStore(connector.context()));
                 runCleanup("connector", () -> connector.connectConnector().stop());
                 runCleanup("connector callback", () -> connectorCallback.ifPresent(DebeziumEngine.ConnectorCallback::connectorStopped));
@@ -766,13 +763,6 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
         }
     }
 
-    private void flushRemainingOffsets() throws InterruptedException, TimeoutException {
-        if (connector.context() != null) {
-            flushOffsets(connector.context().offsetStorageWriter(), clock, config.getLong(EmbeddedEngineConfig.OFFSET_COMMIT_TIMEOUT_MS),
-                    failure -> shutdownError.updateAndGet(previous -> combineFailures(previous, failure)));
-        }
-    }
-
     /** Whether normal shutdown has already been requested, including after completion. */
     public boolean isShutdownRequested() {
         return !State.canBeStopped(getEngineState());
@@ -974,27 +964,6 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
     private static boolean commitOffsets(final OffsetStorageWriter offsetWriter, final io.debezium.util.Clock clock, final long commitTimeout,
                                          final SourceTask task, final Consumer<Throwable> onFailure)
             throws InterruptedException, TimeoutException {
-        if (!flushOffsets(offsetWriter, clock, commitTimeout, onFailure)) {
-            return false;
-        }
-        try {
-            task.commit();
-            return true;
-        }
-        catch (InterruptedException e) {
-            throw e;
-        }
-        catch (Exception e) {
-            LOGGER.warn("Task commit failed after flushing offsets.", e);
-            onFailure.accept(e);
-            return false;
-        }
-    }
-
-    /** Persist acknowledgments without calling a task that may already have stopped. */
-    private static boolean flushOffsets(final OffsetStorageWriter offsetWriter, final io.debezium.util.Clock clock, final long commitTimeout,
-                                        final Consumer<Throwable> onFailure)
-            throws InterruptedException, TimeoutException {
         final long timeout = clock.currentTimeInMillis() + commitTimeout;
         if (!offsetWriter.beginFlush(commitTimeout, TimeUnit.MILLISECONDS)) {
             LOGGER.trace("No offset to be committed.");
@@ -1013,6 +982,7 @@ public final class AsyncEmbeddedEngine<R> implements DebeziumEngine<R>, AsyncEng
             }
 
             flush.get(Math.max(timeout - clock.currentTimeInMillis(), 0), TimeUnit.MILLISECONDS);
+            task.commit();
         }
         catch (InterruptedException e) {
             LOGGER.debug("Flush of the offsets interrupted, canceling the flush.");
